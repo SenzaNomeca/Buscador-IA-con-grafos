@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+release/
+
+# Environment files (contain secrets — solo .env.example / .env.production.example se trackean)
+.env
+.env.local
+.env.production
+.env.*.local
+.env.*-local
+
+# Catalog dump (regenerable con pnpm dump:prod / dump:sync; 112MB)
+apps/api/data/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Test coverage
+coverage/
+
+# Turbo
+.turbo/
+.cache/
+
+# TypeScript build info
+*.tsbuildinfo
+apps/web/vite.config.js
+apps/web/vite.config.d.ts
+
+# Local permissions (per machine, not shared)
+.claude/settings.local.json
+
+# Real images downloaded from S3 (~45MB, not tracked)
+apps/api/test-images-real/
+
+# SSH public key for the vorael tunnel (do NOT push)
+llave-tunel-9913.md
