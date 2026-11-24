@@ -7,6 +7,9 @@ DigitalOcean Spaces.
 
 Producción: **https://n8n.americana.edu.co/vorael/**
 
+> El alcance del producto (objetivos, casos de uso, requisitos y roadmap) está en
+> [MVP.md](MVP.md). Este documento cubre el detalle técnico de implementación.
+
 ---
 
 ## 1. Stack tecnológico
@@ -38,8 +41,8 @@ Producción: **https://n8n.americana.edu.co/vorael/**
 | Data fetching | TanStack Query | 5.x | Cache, revalidación, infinite scroll |
 | Animaciones | Framer Motion | — | Transiciones suaves |
 | Iconos | lucide-react | — | Iconografía ligera |
-| Grafo interactivo | Sigma.js | 3.x | Renderizado WebGL de grafos |
-| Grafo (datoss) | Graphology | 0.26.x | Estructura de datos para sigma |
+| Grafo interactivo | vis-network | 10.x | Render 2D con física Barnes-Hut y resaltado de vecinos |
+| Grafo (datos) | Graphology | 0.26.x | Estructura del grafo y algoritmos (Louvain) |
 | HTTP client | Axios | — | Requests con timeout, interceptores |
 | Routing | React Router | 6.x | SPA routing con basename |
 
@@ -62,7 +65,7 @@ Producción: **https://n8n.americana.edu.co/vorael/**
 ```mermaid
 flowchart TD
     Browser[Navegador] --> Nginx[Nginx\nn8n.americana.edu.co\nHTTPS 443]
-    Nginx --> |"/vorael/*\nstatic files"| SPA[React SPA - Vite\nTailwind + Sigma]
+    Nginx --> |"/vorael/*\nstatic files"| SPA[React SPA - Vite\nTailwind + vis-network]
     Nginx --> |"/vorael/api/*\nproxy_pass"| API[Express API :3001\npg pool + Sharp]
     API --> PostgreSQL[(PostgreSQL\ngenerated_images)]
     API --> S3[DigitalOcean Spaces - S3\nbucket n8ns3]
@@ -103,7 +106,7 @@ flowchart TD
         SPA --> GALL[Gallery: grid con scroll infinito + filtros]
         SPA --> SEARCH[Search: resultados puntuados por relevancia]
         SPA --> DETAIL[ImageDetail: prompts, paleta, descarga]
-        SPA --> GRAPH[Graph: red interactiva con sigma.js WebGL]
+        SPA --> GRAPH[Graph: red interactiva con vis-network]
         SPA --> TAGS[Tags, Stats, Related]
         SPA --> AXIOS[Todo via axios -> proxy Vite -> API Express]
     end
@@ -221,10 +224,10 @@ El sistema puede leer metadatos de imágenes existentes:
 
 Las rutas de búsqueda, tags, filtros, stats y related leen de un grafo en memoria
 (Graphology) sincronizado con PostgreSQL cada 60 segundos. Esto permite:
-- **Búsqueda por token-match** con scoring por relevancia
+- **Búsqueda por coincidencia ponderada de metadatos** (con tramos 80/40/10)
 - **Relaciones multihop** para imágenes relacionadas
 - **Co-ocurrencia de tags** para descubrimiento
-- **Exploración visual** vía grafo interactivo (sigma.js)
+- **Exploración visual** vía grafo interactivo (vis-network)
 
 ### 4.2 Estructura del grafo
 
@@ -256,32 +259,98 @@ Además de Graphology, el motor mantiene:
 
 - `Map<id, ImageRow>` — acceso rápido a fila completa para servir items
 - `Map<dimension, Set<id>>` — invertido por tag/style/mood/use_case/color
-- Texto tokenizado por imagen (minúsculas, frontera de palabra + plural mínimo)
+- Texto tokenizado por imagen: minúsculas, sin tildes, frontera de palabra +
+  plural mínimo; tags como frase completa (`tagPhrases`) y tokens (`tags`)
 - Lista global ordenada `(created_at DESC, id DESC)` — paginado determinista
 
 ### 4.4 Sincronización
 
-- **Arranque:** carga completa de `generated_images`.
-- **Periodicidad:** timer cada `GRAPH_REFRESH_MS` (def. 60s) compara watermark
-  barato (`MAX(created_at)`, `COUNT`). Si cambió → rebuild completo + atomic
-  swap. Nunca se ve un grafo a medias.
+- **Arranque:** carga completa de `generated_images` (Postgres) o del volcado
+  `DB_FILE`. En modo archivo el API **espera al primer vuelco** antes de cargar
+  el grafo (`syncOnce('boot')`).
+- **Deltas:** cada `GRAPH_REFRESH_MS` (def. 60 s) se piden solo las filas cuya
+  clave `(created_at, id)` supera el watermark y se aplican con `applyDelta`
+  sobre el snapshot en memoria. La precisión es de microsegundos (`to_char
+  ... .US`): no se puede redondear a milisegundos o el tick re-trae siempre la
+  última fila.
+- **Reconciliación:** cada `GRAPH_FULL_RELOAD_MS` (def. 600000 = 10 min) se
+  reconstruye todo el grafo desde cero; los deltas no detectan borrados ni
+  ediciones. El swap es atómico: nunca se ve un grafo a medias.
+- **Volcado automático** (`DB_MOCK=true` + `DB_FILE`): al arrancar y cada
+  `AUTO_SYNC_MS` (def. 60000) se sincroniza `data/images.json` contra la API
+  pública (`src/autoSync.ts` → `src/prodSync.ts`). El sync es incremental con
+  corte temprano (2 páginas seguidas de ids conocidos), hace escritura atómica
+  y fuerza un full si el catálogo remoto crece, **se encoge** (reset/bajas) o
+  cumple `SYNC_FULL_MS` (7 d). Tras un full con bajas se recarga el grafo de
+  inmediato. Errores: se conserva el volcado anterior y se reintenta en el
+  próximo tick; no se sustituye por datos mock.
 - **Fallback:** mientras no esté listo o ante rebuild fallido, las rutas migradas
   sirven desde SQL. Se conserva el último snapshot válido.
 
-### 4.5 Búsqueda con token-match
+### 4.5 Búsqueda por coincidencia de metadatos
 
-Cada término de la query debe aparecer como **palabra completa** en
-`subject`/`original_prompt`/`enhanced_prompt` (no como subcadena `%q%` que pegaba
-en "categoría"). Tags siguen siendo overlap exacto (array).
+`scoreSearch` compara cada término significativo de la query (stopwords ES
+filtradas, sin tildes/puntuación) contra los campos de la imagen. El resultado
+es un **porcentaje explicable de coincidencia**, no una probabilidad (en
+semantic/hybrid el coseno puede elevarlo):
 
-| Coincidencia | Puntos |
+```
+cobertura = suma(IDF de términos encontrados) / suma(IDF de términos de la query)
+calidad   = promedio del peso del mejor campo de cada término encontrado
+percent   = round(100 * cobertura * calidad)
+IDF       = log((N + 1) / (df + 1)) + 1
+```
+
+La query se expande con plural mínimo y sinónimos curados (`sonriendo` →
+`sonrisa/sonriente`, `oficina` → `escritorio/office`). Los términos comunes
+pesan menos, y un parcial multi-término solo entra si aporta un término
+distintivo (df ≤ 1% del catálogo, mínimo 10).
+
+Pesos por campo (el tag es metadata curada; el prompt es texto generado):
+
+| Campo | Peso |
 |---|---|
-| cada tag que solapa (`tags && terms`) | 3 |
-| `subject` contiene el término | 2 |
-| `original_prompt` contiene el término | 1 |
-| `enhanced_prompt` contiene el término | 1 |
+| tag exacto (frase completa) | 1.00 |
+| token dentro de un tag multi-palabra | 0.95 |
+| `subject` | 0.90 |
+| `style` / `mood` / `use_case` | 0.85 |
+| `original_prompt` | 0.65 |
+| `enhanced_prompt` | 0.60 |
 
-Orden: `score DESC, created_at DESC, id DESC`.
+Tramos (configurables por env):
+
+| Tramo | Rango | Etiqueta UI |
+|---|---|---|
+| `strong` | `>= 80` | Resultados parecidos |
+| `possible` | `40-79` | Podría encajar |
+| `loose` | `10-39` | Podrían ser similares |
+
+Por debajo de `SEARCH_MATCH_FLOOR` (10) se descarta. Los matches parciales sí
+entran, pero con dos condiciones: el % debe superar el piso y, si la query tiene
+varios términos, al menos uno de los encontrados debe ser distintivo (evita que
+“fondo” o “persona” llenen los tramos bajos). `strong` exige todos los términos
+y cohesión: mismo tag o mismo campo curado; si hay un término distintivo, basta
+con que estén en tags. Excepción: un color debe compartir tag con el sustantivo
+que califica (“fondo blanco” no se arma con “fondo” + “rectángulos blancos”).
+Los parciales solo-prompt se capean a 39 (loose) y los no cohesivos a 79
+(possible), así el % siempre cae dentro de su tramo.
+
+Orden: `percent DESC, coreMatched DESC, metadataScore DESC, semanticScore DESC,
+created_at DESC, id DESC`.
+
+**Modos y respuesta:**
+
+- `lexical`: solo coincidencia de metadatos.
+- `semantic`: top-100 por coseno (sin `SEMANTIC_MIN_SCORE`); el feed léxico solo
+  enriquece el % de esos hits. Si Ollama/tabla no están, degrada a lexical.
+- `hybrid`: une el feed léxico + top-100 semántico (con `SEMANTIC_MIN_SCORE`) y
+  usa `percent = max(metadataPercent, round(cosine * 100))`.
+- `grouped=1`: primera página de cada tramo en `tiers[]`.
+- `tier=strong|possible|loose`: pagina solo ese tramo.
+- Cada item incluye `match: { percent, tier, matched, queryTerms, coverage,
+  coreMatched, distinctive, cohesive, terms[], semanticPercent? }`;
+  `semanticPercent` solo aparece en semantic/hybrid y explica cuándo el % lo
+  elevó el coseno.
 
 ### 4.6 Related (recomendaciones)
 
@@ -295,10 +364,15 @@ El motor de grafo calcula similitud multihop:
 
 | Variable | Defecto | Uso |
 |---|---|---|
-| `GRAPH_REFRESH_MS` | `60000` | Intervalo de refresh del grafo (ms) |
+| `GRAPH_REFRESH_MS` | `60000` | Intervalo de deltas del grafo (ms) |
+| `GRAPH_FULL_RELOAD_MS` | `600000` | Rebuild completo (10 min): reconcilia bajas/ediciones |
 | `SEARCH_ENGINE` | `graph` | `graph` (motor en memoria) o `sql` (rollback) |
 | `METADATA_EMBED` | `none` | `exiftool` (incrustar EXIF/IPTC) o `none` |
 | `DB_MOCK` | `false` | `true` para modo mock (sin PostgreSQL/S3) |
+| `DB_FILE` | `''` | Volcado local del catálogo (solo con `DB_MOCK=true`) |
+| `AUTO_SYNC_MS` | `60000` | Sync del volcado al arrancar y cada N ms; `0` apaga |
+| `AUTO_SYNC_ON_BOOT` | `true` | Volcar antes de cargar el grafo |
+| `DUMP_BASE` | API pública | Origen del volcado; `SYNC_FULL_MS` (7 d) fuerza un full |
 
 ---
 
@@ -341,15 +415,18 @@ interface GraphEdge {
 }
 ```
 
-### 5.2 Frontend (Sigma.js)
+### 5.2 Frontend (vis-network)
 
-- **Renderizado WebGL** via Sigma.js 3 + Graphology
-- **Layout force-directed** (simulación en el cliente)
-- **Toggle de tipos** para mostrar/ocultar nodos por categoría
-- **Click en nodo** para navegar al detalle (imágenes) o filtrar (tags/styles)
-- **Vecindario** al hacer click: resalta conexiones directas
-- **Estadísticas** en tiempo real: nodos/arestas visibles
-- **Responsive** se adapta al tamaño del contenedor
+- **Renderizado con vis-network** (el motor de `graph.html` de Graphify), con
+  física Barnes-Hut: muelles + repulsión.
+- **Rebuild por `data`**: al cambiar el subgrafo se destruye y recrea la red;
+  no se reutiliza una instancia con nodos viejos.
+- **Colores por tipo** los envía la API (`NODE_COLORS` en `graph.ts`); solo se
+  usan `shape` built-in (`dot`, `box`, …), nunca shapes personalizados.
+- **Click en nodo** resalta los vecinos y navega al detalle de imagen o al tag.
+- **Atlas de grupos** (comunidades Louvain) con drill-down a las imágenes del
+  grupo y botón “Volver al atlas”.
+- **Estadísticas** en pantalla: nodos y aristas visibles; responsive.
 
 ### 5.3 Colores de nodos
 
@@ -370,17 +447,23 @@ interface GraphEdge {
 
 | Método y ruta | Query params | Respuesta |
 |---|---|---|
-| `GET /api/health` | — | `{ ok: true, ts: string }` |
+| `GET /api/health` | — | `{ ok, ts, graph: { rows, nodes, edges, builtAt, buildMs } \| null, search: { mode, model } }` |
 | `GET /api/images` | `page` (def. 1), `limit` (máx. 100, def. 24), `style`, `mood`, `use_case` | `{ items: Image[], page, limit, total, hasMore }` |
 | `GET /api/images/:id` | — | `Image` o `{ error: "Image not found" }` (404) |
 | `GET /api/images/:id/download` | `format=webp\|png\|jpg` (def. `webp`) | Binario (Content-Type: image/...) o `{ error }` |
 | `GET /api/images/:id/related` | `limit` (máx. 24, def. 8) | `{ items: Image[] }` |
-| `GET /api/search` | `q`, `page`, `limit` | `{ items: Image[], page, limit, total, hasMore, q }` |
+| `GET /api/search` | `q`, `page`, `limit`, `mode=lexical\|semantic\|hybrid`, `grouped=1`, `tier=strong\|possible\|loose`, `graph=1` | `{ items: SearchItem[], page, limit, total, hasMore, grandTotal, tier?, tierCounts, q, mode, graph? }` o `{ tiers: SearchTierSlice[], total, tierCounts, q, mode, graph? }` con `grouped=1` |
 | `GET /api/tags` | `limit` (máx. 500, def. 200) | `{ items: TagWithCount[] }` |
 | `GET /api/tags/:tag/images` | `page`, `limit` | `{ items: Image[], page, limit, total, hasMore, tag }` |
 | `GET /api/filters` | — | `{ styles: FilterValue[], moods: FilterValue[], useCases: FilterValue[] }` |
 | `GET /api/stats` | — | `{ total, topStyles: FilterValue[], topMoods: FilterValue[], topTags: TagWithCount[] }` |
-| `GET /api/graph` | `types`, `limit`, `center`, `hops` | `{ nodes: GraphNode[], edges: GraphEdge[] }` |
+| `GET /api/graph` | `types`, `limit` (≤600), `center`, `hops`, `ids`, `mode=atlas\|images\|bipartite`, `community` | `{ nodes: GraphNode[], edges: GraphEdge[] }` |
+
+`ids=id1,id2,…` devuelve el subgrafo inducido por ese conjunto: imagen + los
+metadatos compartidos por **2 o más** de esas imágenes (los compartidos por una
+sola se filtran, porque no "unen" nada). Lo usa el toggle “Ver grafo” de la
+búsqueda (`GET /api/search?graph=1` incluye el subgrafo del top-100 en
+`response.graph`).
 
 ### 6.2 Forma de los tipos
 
@@ -399,6 +482,37 @@ interface Image {
   use_case: string | null;
   filename: string | null;
   created_at: string;
+}
+
+type SearchTier = 'strong' | 'possible' | 'loose';
+
+interface SearchMatch {
+  percent: number;      // 0-100 (metadata o max con coseno según modo)
+  tier: SearchTier;
+  matched: number;      // términos significativos encontrados
+  queryTerms: number;   // términos significativos de la query
+  coverage: number;     // cobertura IDF
+  coreMatched: number;  // términos centrales encontrados (desempate)
+  distinctive: boolean; // algún término raro sostenía el match
+  cohesive: boolean;    // términos juntos en tag/campo curado
+  terms: Array<{ term: string; field: string; weight: number }>;
+  semanticPercent?: number; // 0-100, solo en semantic/hybrid
+}
+
+interface SearchItem extends Image {
+  match: SearchMatch;
+}
+
+interface SearchTierSlice {
+  id: SearchTier;
+  label: string;
+  min: number;
+  max: number;
+  count: number;
+  page: number;
+  limit: number;
+  hasMore: boolean;
+  items: SearchItem[];
 }
 
 interface FilterValue {
@@ -421,7 +535,7 @@ Errores conocidos:
 - `/api/images/:id` — 404 si el id no existe
 - `/api/images/:id/download` — 404 si no existe, 500 si no tiene `s3_key`
 - `/api/images/:id/related` — 200 con `items: []` si el id no existe
-- `/api/search` — 200 con `items: []` y `total: 0` si `q` está vacío
+- `/api/search` — 200 con `items: []`, `tiers` vacíos y `total: 0` si `q` está vacío
 - `/api/tags/:tag/images` — 200 con `items: []` si el tag no existe
 
 No hay errores 400/422: los parámetros inválidos se ignoran o se corrigen
@@ -438,12 +552,12 @@ Definidas en [App.tsx](apps/web/src/App.tsx), todas dentro de un Layout común:
 | Ruta | Página | Qué hace |
 |---|---|---|
 | `/` | Gallery | Grid con scroll infinito + panel de filtros |
-| `/search?q=…` | Search | Resultados puntuados, scroll infinito |
+| `/search?q=…` | Search | Resultados agrupados en 3 tramos (80/40/10) + “Ver más” por tramo |
 | `/image/:id` | ImageDetail | Imagen grande, prompts, paleta, tags, descarga, relacionadas |
 | `/tags` | Tags | Todos los tags como chips |
 | `/tag/:tag` | TagPage | Grid filtrado por un tag |
 | `/stats` | Stats | Totales y rankings |
-| `/graph` | Graph | Red interactiva con sigma.js (WebGL) |
+| `/graph` | Graph | Red interactiva con vis-network (atlas + comunidades) |
 | `*` | NotFound | 404 del cliente |
 
 ### 7.2 Data fetching
@@ -476,9 +590,20 @@ Tema oscuro fijo (`color-scheme: dark`):
 | `PORT` | `3001` | Puerto de Express |
 | `HOST` | `127.0.0.1` | Loopback detrás de Nginx |
 | `CORS_ORIGIN` | `*` | Orígenes permitidos |
-| `DB_MOCK` | `false` | Modo mock (sin DB/S3) |
+| `DB_MOCK` | `false` (`true` en `.env.example`) | Modo mock (sin DB/S3) |
+| `DB_FILE` | `''` (`data/images.json` en `.env.example`) | Volcado local del catálogo |
+| `AUTO_SYNC_MS` / `AUTO_SYNC_ON_BOOT` | `60000` / `true` | Vuelco al arrancar y cada 60 s (`0` = apagado) |
+| `DUMP_BASE` / `SYNC_FULL_MS` | API pública / `604800000` | Origen del volcado y full semanal de reconciliación |
 | `SEARCH_ENGINE` | `graph` | Motor de búsqueda |
-| `GRAPH_REFRESH_MS` | `60000` | Intervalo de refresh |
+| `SEARCH_MODE` | `lexical` | `lexical`, `semantic` o `hybrid` |
+| `SEMANTIC_MIN_SCORE` | `0.65` | Filtro de coseno solo en hybrid |
+| `EMBED_MODEL` / `EMBED_SERVER` / `EMBED_DIM` | `bge-m3` / `127.0.0.1:11434` / `1024` | Ollama y dimensiones del vector |
+| `SEARCH_TIER_STRONG` | `80` | Límite inferior de “Resultados parecidos” |
+| `SEARCH_TIER_POSSIBLE` | `40` | Límite inferior de “Podría encajar” |
+| `SEARCH_MATCH_FLOOR` | `10` | Piso de “Podrían ser similares” (debajo se descarta) |
+| `SEARCH_DISTINCTIVE_DF_RATIO` / `SEARCH_DISTINCTIVE_MIN_DF` | `0.01` / `10` | Qué término es bastante raro para sostener un match parcial |
+| `GRAPH_REFRESH_MS` | `60000` | Intervalo de deltas |
+| `GRAPH_FULL_RELOAD_MS` | `600000` | Rebuild completo (reconcilia bajas) |
 | `METADATA_EMBED` | `none` | `exiftool` para incrustar metadatos |
 | `ALLOW_BACKFILL_WRITE` | `false` | Permitir escritura en S3 |
 
@@ -504,13 +629,17 @@ flowchart TD
     ROOT[vorael/] --> ARQ[ARQUITECTURA.md\ndocumento]
     ROOT --> DEPLOY[DEPLOY.md\ndespliegue paso a paso]
     ROOT --> README[README.md\narranque rapido]
+    ROOT --> GUIA[docs/GUIA_DE_ENTREGA.md\nguia completa de uso y entrega]
     ROOT --> DC[docker-compose.yml\nPostgres local puerto 5433]
     ROOT --> PKG[package.json\nscripts del monorepo]
     ROOT --> WS[pnpm-workspace.yaml\nworkspaces: apps/*]
 
     ROOT --> DOCS[docs/]
     DOCS --> PLAN[PLAN_GRAFOS.md\ndecisiones de diseno del motor de grafos]
-    DOCS --> GUIA[VORAEL_GUIA_COMPLETA.md\nguia completa dummies-friendly]
+    DOCS --> CHEAT[CHEATSHEET.md\nmapa rapido de API y codigo]
+    DOCS --> GUIA2[VORAEL_GUIA_COMPLETA.md\nexplicacion conceptual]
+    DOCS --> EMB[GUIDA_EMBEDDINGS.md\ncontexto historico de semantic search]
+    DOCS --> SLIDES[vorael-slides.html\ndiapositivas para clase]
 
     ROOT --> APPS[apps/]
 
@@ -518,7 +647,7 @@ flowchart TD
     API --> EXIFCFG[.ExifTool_config\nnamespace XMP-vorael]
     API --> ENV[.env.example\nplantilla local gitignored real .env]
     API --> ENVP[.env.production.example\nplantilla para servidor]
-    API --> TEST[test/\nsuites de test Vitest 98 tests]
+    API --> TEST[test/\n16 suites, 204 tests Vitest]
     API --> BENCH[bench/\nbenchmark SQL vs grafo]
     API --> TESTIMG[test-images/\nplaceholders mock Sharp 10 archivos]
     API --> TESTREAL[test-images-real/\nimagenes descargadas de S3 simulacion local ~45MB untracked]
@@ -526,6 +655,10 @@ flowchart TD
     SRC --> INDEX[index.ts\napp middleware montaje de rutas]
     SRC --> CONFIG[config.ts\nlectura de .env]
     SRC --> DB[db.ts\npool de pg + modo mock]
+    SRC --> DS[dataSource.ts\nfilas mock/JSON/Postgres]
+    SRC --> AUTOSYNC[autoSync.ts\nvolcado al boot y cada 60s]
+    SRC --> PRODSYNC[prodSync.ts\nsync incremental + full]
+    SRC --> SYN[synonyms.ts\nexpansion curada de sinonimos]
     SRC --> S3FILE[s3.ts\ncliente de Spaces + presign]
     SRC --> GRAPH[graph.ts\nmotor de grafos Graphology + export]
     SRC --> METADATA[metadata.ts\nincrustacion / lectura EXIF IPTC XMP]
@@ -543,7 +676,7 @@ flowchart TD
     WEB --> MAIN[main.tsx\nproviders y BrowserRouter]
     WEB --> APPFILE[App.tsx\nrutas]
     WEB --> PAGES[pages/\nuna por ruta Gallery Search Graph ...]
-    WEB --> COMPONENTS[components/\nlayout features ui]
+    WEB --> COMPONENTS[components/\nlayout features ui (SearchTierSection, GraphCanvas)]
     WEB --> HOOKS[hooks/\ndatos scroll infinito debounce]
     WEB --> SERVICES[services/\ncliente axios + tipos API]
     WEB --> WTYPES[types/\ntipos compartidos con el API]
@@ -574,3 +707,6 @@ flowchart TD
   entra por Nginx.
 - **La sub-ruta `/vorael/`** toca 4 sitios: vite.config.ts (base), main.tsx
   (basename), nginx-vorael.conf (location), index.html (favicon href).
+- **El volcado no se versiona**: `apps/api/data/images.json` se regenera solo
+  al arrancar y cada 60 s. Nunca se sustituye por datos mock si falla; se avisa
+  en logs y se reintenta. Ver [GUIA_DE_ENTREGA.md](docs/GUIA_DE_ENTREGA.md).

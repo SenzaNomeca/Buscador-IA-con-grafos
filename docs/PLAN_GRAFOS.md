@@ -2,6 +2,12 @@
 
 > **Proyecto:** VORAEL — Banco de Imágenes Generadas por IA
 > **Fecha:** 2026-08-30
+>
+> ⚠️ **DOCUMENTO HISTÓRICO:** describe el plan original de implantación, no el
+> comportamiento actual. El buscador ya no usa pesos tags ×4 / subject ×2, sino
+> **cobertura IDF con tramos 80/40/10**. Estado vigente:
+> [ARQUITECTURA.md §4.5](../ARQUITECTURA.md) y
+> [GUIA_DE_ENTREGA.md](GUIA_DE_ENTREGA.md).
 
 ## Decisiones
 

@@ -5,6 +5,14 @@
 > Módulo nuevo: búsqueda por **significado** (no solo por palabras)
 > Fecha: 2026-09-10 · Estado: implementado y verificado contra la réplica (53,839 imágenes)
 
+> **Actualización 2026-10-26:** la ruta `/api/search` ya **no usa RRF**. Los
+> resultados se ordenan por **% de coincidencia de metadatos** (80/40/10) y se
+> agrupan en tres tramos con paginación propia. En hybrid,
+> `percent = max(metadata, coseno×100)`; en semantic puro solo se muestran hits
+> semánticos. Los detalles de RRF de esta guía quedan como contexto histórico
+> del módulo, pero el comportamiento vigente está en
+> [ARQUITECTURA.md §4.5](../ARQUITECTURA.md) y [AGENTS.md](../AGENTS.md).
+
 ---
 
 ## ¿De qué trata esta guía?

@@ -94,7 +94,7 @@ Comprobación local (antes de tocar Nginx):
 
 ```bash
 curl -s http://127.0.0.1:3001/api/health
-# {"ok":true,"ts":"..."}
+# {"ok":true,"ts":"...","graph":{"rows":...,"nodes":...,...},"search":{"mode":"lexical","model":"bge-m3"}}
 ```
 
 ## 4. Nginx
@@ -167,6 +167,14 @@ Cambió el API: `pnpm build:api`, reemplazar `/var/www/html/vorael/api/dist/` y
 - **Postgres**: `DB_HOST=localhost` con `DB_PORT=9913` asume que la base corre
   en el mismo servidor. Si no, apuntar al host real y revisar `DB_SSL`.
   Para desarrollo local se usa Docker en puerto **5433** (`docker-compose.yml`).
+- **Volcado automático**: es exclusivo del modo archivo (`DB_MOCK=true` +
+  `DB_FILE=data/images.json`, `AUTO_SYNC_MS=60000`). En producción se lee
+  directo de Postgres/Spaces, así que el API **no descarga nada**: el refresco
+  del grafo (deltas cada 60 s, full cada 10 min) basta. El `data/images.json`
+  local no se copia al servidor ni se versiona en Git.
+- **Lockfiles**: la raíz usa `pnpm-lock.yaml`; se conserva
+  `apps/api/package-lock.json` únicamente para el `npm install --omit=dev` de
+  este despliegue.
 - **Credenciales**: `apps/api/.env` (el local) tiene claves reales de Spaces y
   Postgres. No incluirlo en el paquete ni en ningún repositorio; el release
   script solo copia `.env.production.example`.

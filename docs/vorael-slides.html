@@ -205,7 +205,7 @@ td:first-child, th:first-child{color:var(--purple); font-weight:600; white-space
       <tr><td>Sharp</td><td>Convierte imágenes (PNG→WebP), redimensiona, optimiza.</td><td>Photoshop pero automático y rápido</td></tr>
       <tr><td>ExifTool</td><td>Lee/escribe metadatos en imágenes.</td><td>"Notas pegadas" a la foto: "tomada en París, 2024"</td></tr>
       <tr><td>Graphology</td><td>Maneja grafos (nodos conectados con líneas) para buscar.</td><td>Mapa del metro: estaciones + líneas</td></tr>
-      <tr><td>Sigma.js</td><td>Dibuja grafos en pantalla con WebGL 3D rápido.</td><td>Google Maps pero para mostrar relaciones</td></tr>
+      <tr><td>vis-network</td><td>Dibuja grafos con física Barnes-Hut (muelles + repulsión).</td><td>Google Maps pero para mostrar relaciones</td></tr>
       <tr><td>TanStack Query</td><td>Maneja cómo el frontend pide datos y los cachea.</td><td>Un bibliotecario que recuerda los libros que pediste</td></tr>
     </tbody>
   </table>
@@ -265,7 +265,7 @@ td:first-child, th:first-child{color:var(--purple); font-weight:600; white-space
     <div class="row"><span class="chip"><span class="dot" style="background:var(--blue)"></span>Frontend</span><span class="arrow">GET /api/graph?limit=200 ─►</span><span class="chip"><span class="dot" style="background:var(--purple)"></span>API</span></div>
     <div class="row"><span class="chip"><span class="dot" style="background:var(--purple)"></span>API</span><span class="arrow">serializa</span><span class="chip"><span class="dot" style="background:var(--green)"></span>Grafo en memoria<br><span class="note">143 nodos, 507 aristas</span></span><span class="arrow">─► nodes + edges</span></div>
     <div class="row"><span class="chip"><span class="dot" style="background:var(--blue)"></span>Frontend</span><span class="arrow">crea grafo ─►</span><span class="chip"><span class="dot" style="background:var(--green)"></span>Graphology<br><span class="note">layout force-directed (50 iteraciones)</span></span></div>
-    <div class="row"><span class="chip"><span class="dot" style="background:var(--green)"></span>Graphology</span><span class="arrow">grafo posicionado ─►</span><span class="chip"><span class="dot" style="background:var(--purple)"></span>Sigma.js<br><span class="note">dibuja con WebGL (3D rápido)</span></span><span class="arrow">─►</span><span class="chip"><span class="dot" style="background:var(--cyan)"></span>Usuario ve la red</span></div>
+    <div class="row"><span class="chip"><span class="dot" style="background:var(--green)"></span>Graphology</span><span class="arrow">grafo posicionado ─►</span><span class="chip"><span class="dot" style="background:var(--purple)"></span>vis-network<br><span class="note">física Barnes-Hut + vecinos resaltados</span></span><span class="arrow">─►</span><span class="chip"><span class="dot" style="background:var(--cyan)"></span>Usuario ve la red</span></div>
   </div>
 </section>
 
@@ -437,7 +437,7 @@ td:first-child, th:first-child{color:var(--purple); font-weight:600; white-space
   <h2>¿Cómo funciona la vista? <span class="tag">06</span></h2>
   <div class="card">
     <h4><span class="flag info">1</span> Render WebGL</h4>
-    <p><strong>Sigma.js</strong> dibuja todo usando <em>WebGL</em> — la misma tecnología de los videojuegos 3D.</p>
+    <p><strong>vis-network</strong> dibuja todo con física <em>Barnes-Hut</em>: los nodos se repelen y los unidos se atraen como resortes.</p>
   </div>
   <div class="card">
     <h4><span class="flag info">2</span> Layout force-directed</h4>
@@ -799,7 +799,7 @@ Similitud: 0.94 → ¡son lo mismo!</pre>
     <li><span class="flag info">5</span> Actualiza PostgreSQL apuntando a URLs locales</li>
   </ol>
   <h3>¿Por qué el grafo dibuja estas imágenes?</h3>
-  <blockquote><p>Con <strong>DB_MOCK=false</strong> se lee de PostgreSQL. La tabla actualizada hace que el auto-refresco (cada 60s) reconstruya el grafo con Graphology, y el frontend (React/Sigma.js) dibuja la red con tus <strong>fotos reales</strong>.</p></blockquote>
+  <blockquote><p>Con <strong>DB_MOCK=false</strong> se lee de PostgreSQL. La tabla actualizada hace que el auto-refresco (cada 60s) reconstruya el grafo con Graphology, y el frontend (React/vis-network) dibuja la red con tus <strong>fotos reales</strong>.</p></blockquote>
 </section>
 
 <!-- ============================== S35 SCRIPTS ============================== -->
@@ -809,7 +809,7 @@ Similitud: 0.94 → ¡son lo mismo!</pre>
     <thead><tr><th>Comando</th><th>¿Qué hace?</th><th>¿Cuándo usarlo?</th></tr></thead>
     <tbody>
       <tr><td>pnpm dev</td><td>Arranca API + web en desarrollo</td><td>Cuando estás programando</td></tr>
-      <tr><td>pnpm test</td><td>Ejecuta los 98 tests</td><td>Para verificar que todo funciona</td></tr>
+      <tr><td>pnpm test</td><td>Ejecuta los 204 tests</td><td>Para verificar que todo funciona</td></tr>
       <tr><td>pnpm build</td><td>Compila para producción</td><td>Antes de subir al servidor</td></tr>
       <tr><td>pnpm export-portable</td><td>Exporta imágenes con metadatos a carpeta local</td><td>Para tener copia local</td></tr>
       <tr><td>pnpm backfill</td><td>Reescribe imágenes en S3 con metadatos</td><td>Para actualizar el S3 completo</td></tr>
@@ -822,8 +822,9 @@ Similitud: 0.94 → ¡son lo mismo!</pre>
 <section class="slide">
   <h2>Preguntas frecuentes (FAQ) <span class="tag">14</span></h2>
   <div class="grid cols-2">
-    <div class="card"><h4>¿Por qué 98 tests?</h4><p>Son un <strong>seguro de vida</strong>. Cada cambio verifica que nada se rompió. Si falla uno, sabemos exactamente qué se rompió.</p></div>
+    <div class="card"><h4>¿Por qué 204 tests?</h4><p>Son un <strong>seguro de vida</strong>. Cada cambio verifica que nada se rompió. Si falla uno, sabemos exactamente qué se rompió.</p></div>
     <div class="card"><h4>¿Por qué refresco cada 60s?</h4><p>Si fuera en cada petición sería lento. Lo mantenemos en memoria y lo actualizamos periódicamente. Como un <em>mapa impreso</em> en vez de dibujarlo a cada paso.</p></div>
+    <div class="card"><h4>¿De dónde salen las imágenes en el demo?</h4><p>El API vuelca el catálogo público al arrancar y cada <strong>60 s</strong> a <span class="hl">data/images.json</span>. Si el remoto borra fotos, un full las quita también. Guion completo en <span class="hl">GUIA_DE_ENTREGA.md</span>.</p></div>
     <div class="card"><h4>¿Si PostgreSQL se cae?</h4><p>Sigue funcionando con el último grafo en memoria. Al volver, el próximo refresh lo actualiza. Como un <em>avión con motor de repuesto</em>.</p></div>
     <div class="card"><h4>¿Por qué CommonJS?</h4><p>El API usa CommonJS porque <strong>sharp</strong> y otras dependencias nativas funcionan mejor. El frontend sí usa ES Modules (Vite).</p></div>
     <div class="card"><h4>¿Qué es "atomic swap"?</h4><p>No se modifica el grafo viejo. Se construye uno nuevo completo y se <strong>reemplaza de golpe</strong>. Nunca se ve un grafo a medias.</p></div>
@@ -841,11 +842,11 @@ Similitud: 0.94 → ¡son lo mismo!</pre>
     <li>Búsqueda inteligente que entiende tags, estilos y moods</li>
     <li>Descarga con metadatos incrustados en cada imagen</li>
     <li>Grafo interactivo que muestra relaciones</li>
-    <li><strong>98 tests</strong> que garantizan que todo funciona</li>
+    <li><strong>204 tests</strong> que garantizan que todo funciona</li>
   </ol>
   <h3>¿Qué tecnologías usamos?</h3>
   <ul>
-    <li>Frontend: <strong>React + Vite + Tailwind + Sigma.js</strong></li>
+    <li>Frontend: <strong>React + Vite + Tailwind + vis-network</strong></li>
     <li>Backend: <strong>Express + TypeScript + PostgreSQL</strong></li>
     <li>Almacenamiento: <strong>DigitalOcean Spaces (S3)</strong></li>
     <li>Procesamiento: <strong>Sharp</strong> + <strong>ExifTool</strong></li>

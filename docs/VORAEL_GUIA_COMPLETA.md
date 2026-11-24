@@ -4,6 +4,17 @@
 > Corporación Universitaria Americana
 > https://n8n.americana.edu.co/vorael/
 
+> **Actualización 2026-10-26:** el buscador ahora muestra los resultados
+> agrupados por **% de coincidencia de metadatos**: “Resultados parecidos”
+> (80-100%), “Podría encajar” (40-79%) y “Podrían ser similares” (10-39%),
+> cada tramo con su propio “Ver más”. Ya no se exige el 50% de cobertura de los
+> párrafos: los matches parciales entran desde el 10%. Ver
+> [ARQUITECTURA.md §4.5](../ARQUITECTURA.md).
+>
+> Para arrancar y demostrar el proyecto paso a paso usa mejor
+> **[GUIA_DE_ENTREGA.md](GUIA_DE_ENTREGA.md)**; este documento es la explicación
+> conceptual para la reunión.
+
 ---
 
 ## ¿Qué es VORAEL?
@@ -52,7 +63,7 @@ flowchart TD
 | **Sharp** | Una librería que convierte imágenes. Convierte PNG → WebP, redimensiona, optimiza. | Como Photoshop pero automático y rápido |
 | **ExifTool** | Un programa que lee y escribe metadatos en imágenes. Los metadatos son "notas pegadas" al archivo. | Como escribir en la espalda de una foto: "tomada en Paris, 2024" |
 | **Graphology** | Una librería para manejar grafos (nodos conectados con líneas). Usa para buscar relaciones. | Como un mapa del metro: estaciones (nodos) conectadas por líneas (aristas) |
-| **Sigma.js** | Una librería para dibujar grafos en pantalla con gráficos 3D rápidos (WebGL). | Como Google Maps pero para mostrar relaciones entre cosas |
+| **vis-network** | Una librería para dibujar grafos en pantalla con física Barnes-Hut (muelles + repulsión). | Como Google Maps pero para mostrar relaciones entre cosas |
 | **TanStack Query** | Maneja cómo el frontend pide datos al backend y los.cachea. | Como un bibliotecario que recuerda los últimos libros que pediste |
 
 ---
@@ -130,7 +141,7 @@ sequenceDiagram
     participant A as API
     participant M as Grafo en memoria
     participant GR as Graphology
-    participant SI as Sigma.js
+    participant SI as vis-network
 
     U->>F: Abre /vorael/graph
     F->>A: GET /api/graph?limit=200
@@ -251,16 +262,25 @@ Cuando arranca el API, lee todas las imágenes de PostgreSQL y crea:
 
 Cuando buscas "cat sunset", el sistema:
 
-1. **Tokeniza y deduplica**: `["cat", "sunset"]` (términos únicos, en minúsculas)
-2. Para cada imagen calcula un **score por término** que coincide:
-   - ¿Aparece como **tag**? → +4 puntos (peso alto)
-   - ¿Aparece como palabra en el **subject**? → +2 puntos
-   - ¿Aparece como palabra en el **prompt original o mejorado**? → +1 punto cada uno
-3. **Filtro de cobertura** (para párrafos):
-   - Queries de 1-3 términos: basta que **uno** coincida (comporta OR)
-   - Queries largas: se exige que coincida **≥ 50%** de los términos únicos
-4. **Ordena** por puntaje DESC (empate: fecha DESC, id DESC)
-5. Devuelve las más relevantes
+1. **Normaliza y deduplica**: `["cat", "sunset"]` (minúsculas, sin tildes ni
+   puntuación, stopwords del español fuera)
+2. Expande cada término con plural mínimo y sinónimos curados (`sonriendo` →
+   `sonrisa/sonriente`, `oficina` → `escritorio/office`). Para cada imagen se
+   queda con el **mejor campo** donde aparece:
+   - tag exacto → **1.00**; token dentro de un tag multi-palabra → **0.95**
+   - subject → **0.90**; style/mood/use_case → **0.85**
+   - prompt original → **0.65**; prompt mejorado → **0.60**
+3. Calcula `percent = 100 × coberturaIDF × (promedio del mejor peso por
+   término)`. La cobertura pesa por IDF: los términos comunes (“fondo”,
+   “persona”) no completan una búsqueda multi-término con poco esfuerzo.
+4. **Agrupa** por tramo: ≥80 “Resultados parecidos” (exige todos los términos y
+   cohesión en un mismo tag/campo curado), 40-79 “Podría encajar”, 10-39
+   “Podrían ser similares”. Debajo de 10% no se muestra. Un parcial multi-término
+   solo entra si aporta un término distintivo; los parciales solo-prompt se
+   capean a 39 y los no cohesivos a 79.
+5. **Ordena** por `percent` DESC (empate: `coreMatched`, riqueza de campos,
+   fecha, id) y devuelve la primera página de cada tramo. Cada tramo tiene su
+   “Ver más”.
 
 ### ¿Qué es "related" (imágenes relacionadas)?
 
@@ -290,7 +310,7 @@ Las líneas muestran las conexiones.
 
 ### ¿Cómo funciona?
 
-1. **Sigma.js** dibuja todo usando **WebGL** (la misma tecnología de los videojuegos 3D)
+1. **vis-network** dibuja todo con física **Barnes-Hut** (muelles + repulsión)
 2. Los nodos se posicionan automáticamente con un **algoritmo force-directed**:
    - Los nodos se repelen (como imanes del mismo polo)
    - Los nodos conectados se atraen (como resortes)
@@ -345,75 +365,67 @@ Cada palabra debe aparecer como **palabra completa**, no como parte de otra pala
 
 **Analogía:** Es como buscar en Google. Si buscas "gato", Google no te muestra resultados de "categoría" ni "agusete". Busca la palabra exacta.
 
-### Paso 3: Calcular el puntaje (Scoring)
+### Paso 3: Calcular el % de coincidencia
 
-No todas las coincidencias valen lo mismo. El puntaje se calcula **por término**: cada palabra de tu búsqueda que coincide suma puntos según dónde aparezca.
+No todas las coincidencias valen lo mismo. Para cada término se busca el
+**mejor campo** donde aparece y se le asigna un peso:
 
 ```mermaid
 flowchart LR
     subgraph PORTERMINO["POR CADA TÉRMINO DE LA QUERY"]
-        T["Coincide como TAG"] -->|+4 puntos| TOTAL["Total = suma"]
-        S["Coincide como palabra en SUBJECT"] -->|+2 puntos| TOTAL
-        P["Coincide como palabra en PROMPT"] -->|+1 punto| TOTAL
+        T["TAG exacto"] -->|1.00| TOTAL["Mejor peso del término"]
+        TT["Token dentro de tag multi-palabra"] -->|0.95| TOTAL
+        S["SUBJECT"] -->|0.90| TOTAL
+        M["STYLE / MOOD / USE_CASE"] -->|0.85| TOTAL
+        P["PROMPT original"] -->|0.65| TOTAL
+        E["PROMPT mejorado"] -->|0.60| TOTAL
     end
 ```
 
-**Ejemplo real** (query "cat sunset"):
+Luego:
 
 ```
-Query: "cat sunset"
-
-Imagen 1: tags=[cat, sunset, nature], subject="Cat at sunset"
-  → "cat" coincide en tag: +4
-  → "sunset" coincide en tag: +4
-  → "cat" en subject: +2
-  → "sunset" en subject: +2
-  → TOTAL: 12 puntos [TOP]
-
-Imagen 2: tags=[cat, library], subject="Cat in library"
-  → "cat" coincide en tag: +4
-  → "sunset" NO coincide: +0
-  → TOTAL: 4 puntos
-
-Imagen 3: tags=[dog, park], subject="Dog in park"
-  → "cat" NO coincide: +0
-  → "sunset" NO coincide: +0
-  → TOTAL: 0 puntos
+cobertura = términos encontrados / términos significativos
+calidad   = promedio del mejor peso de cada término encontrado
+percent   = round(100 × cobertura × calidad)
 ```
 
-### Paso 4: Filtro de cobertura (para párrafos)
-
-Aquí está la clave de la búsqueda "tipo párrafo". VORAEL cuenta **cuántos términos únicos** de tu consulta coincidieron en cada imagen:
+**Ejemplo** (query "cat sunset", 2 términos):
 
 ```
-"cat sunset"        → 2 términos únicos
-"a cat sleeping on  → 9 términos únicos
- old books in a
- grand library"
+Imagen 1: tags=[cat, sunset], subject="Cat at sunset"
+  → cat: tag 1.00 · sunset: tag 1.00
+  → cobertura 2/2, calidad 1.00 → 100% → “Resultados parecidos”
+
+Imagen 2: tags=[cat], subject="Cat in library"
+  → cat: tag 1.00 · sunset: sin match
+  → cobertura 1/2, calidad 1.00 → 50% → “Podría encajar”
+
+Imagen 3: solo prompt "a dog in a park"
+  → cat: sin match · sunset: sin match
+  → 0% → no aparece
 ```
 
-- **Queries cortas (1-3 términos):** basta que **un** término coincida. Esto mantiene el comportamiento OR de siempre: buscar "cat spaceship" devuelve las imágenes con tag "cat" aunque "spaceship" no exista.
-- **Párrafos (4+ términos):** se exige que coincidan **al menos el 50%** de los términos únicos. Si escribes un párrafo de 14 palabras, solo aparecen imágenes que coincidan con 7 o más.
+### Paso 4: Agrupar en tres tramos
 
-```
-Párrafo: "a cat sleeping on old books in a grand library with golden light"
+El porcentaje no es una probabilidad: mide **cuánto de lo que buscaste aparece
+en los metadatos**. Los resultados se muestran en tres secciones ordenadas:
 
-Imagen A: coincide con "a", "cat", "sleeping", "on", "old", "books",
-          "in", "grand", "library" → 9/9 términos → 100% → APARECE
-Imagen B: solo comparte "a" → 1/9 → 11% → NO aparece
-```
+| Tramo | Rango | Qué significa |
+|---|---|---|
+| **Resultados parecidos** | 80-100% | Coinciden en la mayoría de los metadatos |
+| **Podría encajar** | 40-79% | Comparten parte de la búsqueda |
+| **Podrían ser similares** | 10-39% | Coinciden en pocos términos o por semántica |
 
-Este filtro elimina el "ruido": antes un párrafo devolvía 157 imágenes (cualquiera que compartiera una palabra); ahora solo vuelven las realmente relevantes.
+Debajo del **10%** se descarta. Los matches parciales sí entran (no se exige un
+50% ni un 75% de cobertura como antes). Cada sección tiene su propio botón
+“Ver más”.
 
 ### Paso 5: Ordenar y devolver
 
-Las imágenes se ordenan por puntaje (mayor a menor) y se devuelven las mejores.
-
-```
-1. Imagen 1 (12 pts) → ¡la más relevante!
-2. Imagen 2 (4 pts)
-3. Imagen 3 (0 pts) → no aparece en resultados
-```
+Dentro de cada tramo se ordena por `percent` DESC; los empates se resuelven por
+cantidad/peso de campos coincidentes, fecha de creación e id. La respuesta trae
+la primera página de cada tramo y el total de cada uno.
 
 ---
 
@@ -528,16 +540,16 @@ Embeddings semánticos:
 
 ```mermaid
 flowchart TD
-    A["1. Tokenizar y deduplicar: 'gato atardecer' -> gato, atardecer"] --> B["2. Token-Match: palabra completa"]
-    B --> C["3. Scoring por término: tags x4 + subject x2 + prompts x1"]
-    C --> D["4. Filtro de cobertura: >= 50% en párrafos, OR en queries cortas"]
-    D --> E["5. Ordenar: score DESC, fecha DESC"]
-    E --> F["6. Co-ocurrencia: tags que aparecen juntos"]
-    F --> G["7. Jaccard: calcular similitud entre conjuntos"]
-    G --> H["Resultado: imagenes ordenadas por relevancia"]
+    A["1. Normalizar y deduplicar: 'gato atardecer' -> gato, atardecer"] --> B["2. Buscar cada término en los metadatos"]
+    B --> C["3. Mejor peso por término: tag 1.00 · subject 0.90 · prompts 0.60-0.65"]
+    C --> D["4. percent = cobertura × calidad ponderada"]
+    D --> E["5. Agrupar: >=80 · 40-79 · 10-39 · <10 se descarta"]
+    E --> F["6. Ordenar por percent DESC, campos, fecha, id"]
+    F --> G["7. Co-ocurrencia/Jaccard: imágenes relacionadas"]
+    G --> H["Resultado: primera página de cada tramo + 'Ver más'"]
 ```
 
-**En una frase:** VORAEL busca palabra por palabra (con plural mínimo y acentos normalizados), pondera donde aparece cada término (tags > subject > prompts), exige cobertura mínima en párrafos para no devolver ruido, y usa co-ocurrencia para encontrar imágenes similares. Es como un mini-Google pero optimizado para un catálogo de imágenes.
+**En una frase:** VORAEL normaliza la búsqueda (sin tildes, sin stopwords, plural mínimo), busca cada término en tags/subject/estilo/mood/uso/prompts, calcula un **% de coincidencia de metadatos**, lo agrupa en tres tramos y usa co-ocurrencia para encontrar imágenes similares. Es como un mini-Google pero optimizado para un catálogo de imágenes y con resultados explicables.
 
 ---
 
@@ -551,6 +563,10 @@ Las variables de entorno son como los **interruptores de luz** del sistema. Pued
 |---|---|---|---|
 | `DB_MOCK` | ¿Usar base de datos real? | `false` | `true` (usa datos inventados) |
 | `SEARCH_ENGINE` | Motor de búsqueda | `graph` | `sql` (fallback) |
+| `SEARCH_MODE` | Búsqueda léxica o semántica | `lexical` | `semantic` / `hybrid` |
+| `SEARCH_TIER_STRONG` | Piso de “Resultados parecidos” | `80` | `80` |
+| `SEARCH_TIER_POSSIBLE` | Piso de “Podría encajar” | `40` | `40` |
+| `SEARCH_MATCH_FLOOR` | Piso de “Podrían ser similares” | `10` | `10` |
 | `METADATA_EMBED` | ¿Incrustar metadatos? | `exiftool` | `none` |
 | `ALLOW_BACKFILL_WRITE` | ¿Permitir escribir en S3? | `false` | `true` |
 | `GRAPH_REFRESH_MS` | Cada cuánto refresca el grafo | `60000` (1 min) | `60000` |
@@ -581,7 +597,8 @@ Un "endpoint" es una dirección web que el frontend puede visitar para obtener d
 | `GET /api/images/:id` | Una imagen específica | Detalle de imagen |
 | `GET /api/images/:id/download` | Archivo de imagen | Botón de descarga |
 | `GET /api/images/:id/related` | Imágenes similares | "Ver relacionadas" |
-| `GET /api/search?q=gato` | Resultados de búsqueda | Buscador |
+| `GET /api/search?q=gato&grouped=1` | Resultados agrupados por % de match | Buscador (3 tramos) |
+| `GET /api/search?q=gato&tier=possible&page=2` | Página 2 de un tramo | “Ver más” de una sección |
 | `GET /api/tags` | Todos los tags con conteo | Página de tags |
 | `GET /api/filters` | Estilos, moods, usos disponibles | Panel de filtros |
 | `GET /api/stats` | Estadísticas generales | Página de stats |
@@ -636,7 +653,7 @@ Para poder probar el sistema completo usando imágenes reales sin afectar el ent
 
 ### ¿Por qué el Grafo dibuja estas imágenes?
 
-Con `DB_MOCK=false`, el motor de la aplicación **lee obligatoriamente de PostgreSQL**. Al haber actualizado la tabla `generated_images` en la base de datos Docker con nuestras imágenes reales descargadas y enriquecidas, el ciclo de auto-refresco del API (cada 60 segundos) detecta los nuevos datos. Automáticamente construye el grafo in-memory usando **Graphology** y el frontend (React/Sigma.js) dibuja la red interactiva con tus **fotos reales**.
+Con `DB_MOCK=false`, el motor de la aplicación **lee obligatoriamente de PostgreSQL**. Al haber actualizado la tabla `generated_images` en la base de datos Docker con nuestras imágenes reales descargadas y enriquecidas, el ciclo de auto-refresco del API (cada 60 segundos) detecta los nuevos datos. Automáticamente construye el grafo in-memory usando **Graphology** y el frontend (React/vis-network) dibuja la red interactiva con tus **fotos reales**.
 
 ---
 
@@ -673,7 +690,7 @@ Las imágenes `s3_url` reutilizan cíclicamente los 30 archivos reales de `test-
 | Comando | ¿Qué hace? | ¿Cuándo usarlo? |
 |---|---|---|
 | `pnpm dev` | Arranca API + web en desarrollo | Cuando estás programando |
-| `pnpm test` | Ejecuta los 110 tests | Para verificar que todo funciona |
+| `pnpm test` | Ejecuta los 202 tests | Para verificar que todo funciona |
 | `pnpm build` | Compila para producción | Antes de subir al servidor |
 | `pnpm export-portable` | Exporta imágenes con metadatos a carpeta local | Para tener copia local |
 | `pnpm backfill` | Reescribe imágenes en S3 con metadatos | Para actualizar el S3 completo |
@@ -686,13 +703,13 @@ Las imágenes `s3_url` reutilizan cíclicamente los 30 archivos reales de `test-
 
 ## Preguntas frecuentes (FAQ)
 
-### ¿Por qué hay 110 tests?
+### ¿Por qué hay 202 tests?
 
-Los tests son como un **seguro de vida**. Cada vez que alguien cambia el código, los tests verifican que nada se rompió. Si un test falla, sabemos exactamente qué se rompió. Incluyen 7 tests del generador de dataset sintético y 5 tests de cobertura (búsqueda de párrafos).
+Los tests son como un **seguro de vida**. Cada vez que alguien cambia el código, los tests verifican que nada se rompió. Si un test falla, sabemos exactamente qué se rompió. Incluyen tests del motor de grafos, búsqueda por tramos, embeddings, rutas, filtros, tags y metadatos ExifTool.
 
 ### ¿Puedo buscar un párrafo completo?
 
-Sí, en inglés. El buscador separa tu texto en palabras y exige que la imagen coincida con al menos el 50% de ellas (en queries de 4+ términos). Un párrafo en español no dará resultados porque los datos están en inglés; prueba con palabras clave sueltas o frases cortas.
+Sí, en inglés. El buscador separa tu texto en términos significativos (sin stopwords ni tildes), calcula qué porcentaje de ellos aparece en los metadatos de cada imagen y muestra los resultados desde el 10% de coincidencia. Un párrafo en español no dará resultados porque los datos están en inglés; prueba con palabras clave sueltas o frases cortas.
 
 ### ¿Por qué el grafo se refresca cada 60 segundos?
 
@@ -732,11 +749,11 @@ Un **sistema completo** para mostrar, buscar y descargar imágenes generadas por
 2. **Búsqueda inteligente** que entiende tags, estilos y moods
 3. **Descarga con metadatos** incrustados en cada imagen
 4. **Grafo interactivo** que muestra relaciones entre imágenes
-5. **98 tests** que garantizan que todo funciona
+5. **204 tests** que garantizan que todo funciona
 
 ### ¿Qué tecnologías usamos?
 
-- **Frontend:** React + Vite + Tailwind + Sigma.js
+- **Frontend:** React + Vite + Tailwind + vis-network
 - **Backend:** Express + TypeScript + PostgreSQL
 - **Almacenamiento:** DigitalOcean Spaces (S3)
 - **Procesamiento:** Sharp (imágenes) + ExifTool (metadatos)

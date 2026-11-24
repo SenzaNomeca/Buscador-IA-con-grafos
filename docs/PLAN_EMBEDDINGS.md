@@ -2,7 +2,12 @@
 
 > **Proyecto:** VORAEL — Banco de Imágenes Generadas por IA
 > **Fecha:** 2026-09-10
-> **Estado:** Aprobado por el usuario. Pendiente de ejecución.
+> **Estado histórico:** aprobado y ejecutado; el plan original descrito abajo
+> (modo `hybrid` por RRF y `SEARCH_MODE=hybrid` por defecto) **ya no refleja la
+> ruta actual**: el default es `lexical` y en hybrid se usa
+> `percent = max(metadatos, coseno × 100)`. Ver
+> [ARQUITECTURA.md §4.5](../ARQUITECTURA.md) y
+> [GUIA_EMBEDDINGS.md](GUIA_EMBEDDINGS.md).
 
 ## Contexto
 
