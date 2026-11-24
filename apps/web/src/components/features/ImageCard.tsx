@@ -2,13 +2,52 @@ import { motion, type Variants } from 'framer-motion';
 import { Download, Eye, Network } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useState } from 'react';
-import type { Image } from '@/types/image';
+import { cn } from '@/lib/utils';
+import type { Image, MatchTerm, SearchMatch, SearchTier } from '@/types/image';
 
 interface Props {
   image: Image;
   /** Index within the current batch/page — used to compute stagger delay. */
   index?: number;
   onDownload?: (image: Image) => void;
+  /** Coincidencia de la búsqueda (badge de % + tooltip de campos). */
+  match?: SearchMatch;
+}
+
+const MATCH_BADGE: Record<SearchTier, string> = {
+  strong: 'border-emerald-400/40 bg-emerald-400/15 text-emerald-100',
+  possible: 'border-amber-400/40 bg-amber-400/15 text-amber-100',
+  loose: 'border-sky-400/40 bg-sky-400/15 text-sky-100',
+};
+
+const FIELD_LABELS: Record<MatchTerm['field'], string> = {
+  tag: 'tag',
+  tagToken: 'tag',
+  subject: 'sujeto',
+  style: 'estilo',
+  mood: 'mood',
+  useCase: 'uso',
+  original: 'prompt',
+  enhanced: 'prompt mejorado',
+};
+
+function matchTooltip(match: SearchMatch): string {
+  const parts: string[] = [];
+  if (match.terms.length > 0) {
+    const details = match.terms
+      .slice(0, 5)
+      .map((t) => `${FIELD_LABELS[t.field]}: ${t.term}`)
+      .join(' · ');
+    const coverage =
+      typeof match.queryTerms === 'number' && match.queryTerms > 1
+        ? ` (${match.matched} de ${match.queryTerms} términos)`
+        : '';
+    parts.push(`Coincide en ${details}${coverage}`);
+  }
+  if (typeof match.semanticPercent === 'number') {
+    parts.push(`Similitud semántica ${match.semanticPercent}%`);
+  }
+  return parts.join(' · ') || 'Coincidencia semántica';
 }
 
 const cardVariants: Variants = {
@@ -26,7 +65,7 @@ const cardVariants: Variants = {
   }),
 };
 
-export function ImageCard({ image, index = 0, onDownload }: Props) {
+export function ImageCard({ image, index = 0, onDownload, match }: Props) {
   const [loaded, setLoaded] = useState(false);
   const navigate = useNavigate();
 
@@ -55,6 +94,17 @@ export function ImageCard({ image, index = 0, onDownload }: Props) {
               loaded ? 'opacity-100' : 'opacity-0'
             }`}
           />
+          {match && (
+            <span
+              title={matchTooltip(match)}
+              className={cn(
+                'absolute left-2 top-2 z-10 rounded-full border px-2 py-0.5 text-[11px] font-semibold backdrop-blur-sm',
+                MATCH_BADGE[match.tier],
+              )}
+            >
+              {match.percent}%
+            </span>
+          )}
           {/* Overlay difuminado sobre la foto al hover */}
           <div className="absolute inset-0 bg-canvas/70 opacity-0 backdrop-blur-[2px] transition-opacity duration-200 group-hover:opacity-100" />
           {/* Botones apilados, centrados encima de la foto */}

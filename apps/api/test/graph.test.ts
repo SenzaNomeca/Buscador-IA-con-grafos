@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { buildGraph, GraphStore } from '../src/graph';
 import { sampleRows, tokenRows, emptyRows, resetCounter } from './fixtures/images';
-import type { ImageRow } from '../src/types';
 
 beforeEach(() => {
   resetCounter();
@@ -148,7 +147,12 @@ describe('buildGraph', () => {
     expect(snap.stats.total).toBe(1);
     expect(snap.tagIndex.size).toBe(0);
     expect(snap.textIndex.get('emp-01')).toEqual({
+      tagPhrases: new Set(),
+      tags: new Set(),
       subject: new Set(),
+      style: new Set(),
+      mood: new Set(),
+      useCase: new Set(),
       original: new Set(),
       enhanced: new Set(),
     });

@@ -55,13 +55,26 @@ export const config = {
     dim: Number(optional('EMBED_DIM', '1024')),
     minScore: Number(optional('SEMANTIC_MIN_SCORE', '0.65')),
   },
+  // Tramos de coincidencia de la búsqueda (ver scoreSearch/computeMetadataMatch).
+  // El % es cobertura ponderada de metadatos, no una probabilidad.
+  search: {
+    tierStrong: Number(optional('SEARCH_TIER_STRONG', '80')),
+    tierPossible: Number(optional('SEARCH_TIER_POSSIBLE', '40')),
+    floor: Number(optional('SEARCH_MATCH_FLOOR', '10')),
+    // Un término cuenta como "distintivo" (evidencia fuerte en un match
+    // parcial) si aparece en muy pocas imágenes del catálogo. El mínimo evita
+    // que corpus pequeños (tests) marquen todo como frecuente.
+    distinctiveDfRatio: Number(optional('SEARCH_DISTINCTIVE_DF_RATIO', '0.01')),
+    distinctiveMinDf: Number(optional('SEARCH_DISTINCTIVE_MIN_DF', '10')),
+  },
   metadata: {
     embed: optional('METADATA_EMBED', 'none') as 'exiftool' | 'none',
   },
   // Auto-sync del volcado local (DB_FILE) contra la API pública — ver src/autoSync.ts.
-  // ms=0 (default) = apagado. Ej: AUTO_SYNC_MS=3600000 → cada 1h.
+  // Por defecto se vuelca al arrancar y cada 60 s (el mismo cadencia que el
+  // refresh del grafo). ms=0 lo desactiva explícitamente.
   autoSync: {
-    ms: Number(optional('AUTO_SYNC_MS', '0')),
+    ms: Number(optional('AUTO_SYNC_MS', '60000')),
     onBoot: optional('AUTO_SYNC_ON_BOOT', 'true').toLowerCase() !== 'false',
   },
 };

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import express from 'express';
-import { graphStore, GraphStore } from '../src/graph';
+import { graphStore } from '../src/graph';
 import { graphRouter } from '../src/routes/graph';
 import { sampleRows } from './fixtures/images';
 
@@ -66,7 +66,7 @@ describe('GET /api/graph', () => {
     expect(res.status).toBe(200);
     expect(res.body.nodes.length).toBeGreaterThan(0);
     // Center node should be in the results.
-    const ids = res.body.nodes.map((n: any) => n.id);
+    const ids = res.body.nodes.map((n: { id: string }) => n.id);
     expect(ids).toContain(firstImg);
   });
 
@@ -77,10 +77,10 @@ describe('GET /api/graph', () => {
     expect(res.body.nodes.length).toBeGreaterThan(0);
     // Todos los ids pedidos deben estar (los 3 son imágenes).
     for (const id of imgs) {
-      expect(res.body.nodes.map((n: any) => n.id)).toContain(id);
+      expect(res.body.nodes.map((n: { id: string }) => n.id)).toContain(id);
     }
     // Las aristas solo conectan nodos del subgrafo.
-    const present = new Set(res.body.nodes.map((n: any) => n.id));
+    const present = new Set(res.body.nodes.map((n: { id: string }) => n.id));
     for (const e of res.body.edges) {
       expect(present.has(e.source)).toBe(true);
       expect(present.has(e.target)).toBe(true);

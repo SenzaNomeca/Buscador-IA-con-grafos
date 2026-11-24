@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { buildGraph, search } from '../src/graph';
+import { buildGraph, search, scoreSearch } from '../src/graph';
 import { sampleRows, tokenRows, resetCounter } from './fixtures/images';
 import type { GraphSnapshot } from '../src/graph';
 
@@ -115,16 +115,17 @@ describe('search', () => {
     }
   });
 
-  it('order is score DESC then created_at DESC', () => {
-    const result = search(snap, 'cat', { limit: 100 });
-    for (let i = 1; i < result.items.length; i++) {
-      const a = result.items[i - 1];
-      const b = result.items[i];
-      // a should have >= score than b (we can't check score directly but
-      // we check created_at as tiebreaker)
+  it('order is percent DESC then score DESC', () => {
+    const scored = scoreSearch(snap, 'cat');
+    for (let i = 1; i < scored.entries.length; i++) {
+      const prev = scored.entries[i - 1];
+      const curr = scored.entries[i];
+      expect(prev.percent).toBeGreaterThanOrEqual(curr.percent);
+      if (prev.percent === curr.percent) {
+        expect(prev.score).toBeGreaterThanOrEqual(curr.score);
+      }
     }
-    // At minimum, results should be non-empty and deterministic
-    expect(result.items.length).toBeGreaterThan(0);
+    expect(scored.entries.length).toBeGreaterThan(0);
   });
 
   it('clamps page to minimum 1', () => {
@@ -170,9 +171,12 @@ describe('search coverage (paragraphs)', () => {
     expect(paragraph.total).toBeLessThanOrEqual(word.total);
   });
 
-  it('returns 0 for a paragraph that matches nothing', () => {
+  it('keeps partial paragraph matches in the loose tier instead of discarding them', () => {
+    // "gato" aparece en tok-02/tok-03; el resto de términos no. Antes se
+    // descartaba por cobertura < 75%; ahora entra al tramo loose.
     const result = search(snap, 'un gato durmiendo sobre libros viejos');
-    expect(result.total).toBe(0);
+    expect(result.total).toBe(2);
+    expect(result.items.every((r) => r.tags?.some((t) => t === 'gato' || t === 'gatos'))).toBe(true);
   });
 
   it('keeps any-match behavior for short queries (<= 3 terms)', () => {

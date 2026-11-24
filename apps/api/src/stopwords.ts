@@ -27,21 +27,41 @@ export const STOPWORDS: ReadonlySet<string> = new Set([
   'allí', 'ahí', 'así', 'más', 'menos', 'muy', 'mucho', 'muchos', 'bien',
 ]);
 
+/** Minúsculas + sin diacríticos. Mantiene la misma forma que el índice. */
+function fold(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+// Las stopwords se guardan con tildes ("según", "más"); el índice y la query
+// se normalizan sin ellas, así que comparamos contra una copia plegada.
+const FOLDED_STOPWORDS: ReadonlySet<string> = new Set([...STOPWORDS].map(fold));
+
 export function isStopword(token: string): boolean {
-  return STOPWORDS.has(token.toLowerCase());
+  return FOLDED_STOPWORDS.has(fold(token));
 }
 
 /**
- * Términos con contenido semántico de una query, en minúsculas y sin duplicados.
+ * Normaliza una query con la misma tokenización que el índice del grafo:
+ * minúsculas, sin tildes, separada por cualquier carácter no alfanumérico.
+ * Sin esto, "niño" no matcheaba "nino" y "gato," no matcheaba "gato".
+ */
+function normalizeTokens(text: string): string[] {
+  return fold(text)
+    .split(/[^\p{L}\p{N}]+/u)
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0);
+}
+
+/**
+ * Términos con contenido semántico de una query, normalizados y sin duplicados.
  * Filtra stopwords. Si la query queda vacía (p. ej. "de"), devuelve los tokens
  * originales para no perder la búsqueda.
  */
 export function meaningfulTerms(q: string): string[] {
-  const tokens = q
-    .toLowerCase()
-    .split(/\s+/)
-    .map((t) => t.trim())
-    .filter((t) => t.length > 0);
+  const tokens = normalizeTokens(q);
 
   const meaningful = [...new Set(tokens.filter((t) => !isStopword(t)))];
   return meaningful.length > 0 ? meaningful : [...new Set(tokens)];

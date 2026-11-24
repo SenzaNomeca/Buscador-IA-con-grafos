@@ -35,8 +35,19 @@ const { mockSnapshot, mockSearch, mockScoreSearch, mockRelated, mockTagsList, mo
       hasMore: false,
     }),
     mockScoreSearch: vi.fn().mockReturnValue({
+      entries: [
+        {
+          id: 'g1',
+          percent: 100,
+          tier: 'strong',
+          score: 1,
+          matched: 1,
+          terms: [{ term: 'cat', field: 'tag', weight: 1 }],
+        },
+      ],
       ids: ['g1'],
       total: 1,
+      tierCounts: { strong: 1, possible: 0, loose: 0 },
     }),
     mockRelated: vi.fn().mockReturnValue({
       items: [{ id: 'g2', s3_url: 'https://example.com/g2.webp', tags: ['dog'] }],
@@ -79,7 +90,7 @@ vi.mock('../src/s3', () => ({
 }));
 
 // Stub de la búsqueda semántica: la ruta hace import() dinámico de
-// '../embeddings'. Mantenemos searchSemantic/rrfFuse reales (importOriginal) y
+// '../embeddings'. Mantenemos searchSemantic/cosine reales (importOriginal) y
 // controlamos solo el índice y el embedding de la query.
 const sem = vi.hoisted(() => ({
   getSemanticIndex: vi.fn(),
@@ -95,23 +106,27 @@ vi.mock('../src/embeddings', async (importOriginal) => {
   };
 });
 
-vi.mock('../src/graph', () => ({
-  graphStore: {
-    ready: true,
-    snapshot: mockSnapshot,
-    exportGraph: mockExportGraph,
-  },
-  search: mockSearch,
-  scoreSearch: mockScoreSearch,
-  related: mockRelated,
-  tagsList: mockTagsList,
-  tagImages: mockTagImages,
-  filters: mockFilters,
-  stats: mockStats,
-  fetchAllRows: vi.fn().mockResolvedValue([]),
-  fetchDeltaRows: vi.fn().mockResolvedValue([]),
-  applyDelta: vi.fn(),
-}));
+vi.mock('../src/graph', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/graph')>();
+  return {
+    ...actual,
+    graphStore: {
+      ready: true,
+      snapshot: mockSnapshot,
+      exportGraph: mockExportGraph,
+    },
+    search: mockSearch,
+    scoreSearch: mockScoreSearch,
+    related: mockRelated,
+    tagsList: mockTagsList,
+    tagImages: mockTagImages,
+    filters: mockFilters,
+    stats: mockStats,
+    fetchAllRows: vi.fn().mockResolvedValue([]),
+    fetchDeltaRows: vi.fn().mockResolvedValue([]),
+    applyDelta: vi.fn(),
+  };
+});
 
 import request from 'supertest';
 import { app } from '../src/index';
@@ -190,6 +205,39 @@ describe('GET /api/search', () => {
     expect(res.body.graph).toBeUndefined();
     expect(mockExportGraph).not.toHaveBeenCalled();
   });
+
+  it('grouped=1 devuelve los tres tramos con su primera página', async () => {
+    const res = await request(baseUrl()).get('/api/search?q=cat&grouped=1');
+    expect(res.status).toBe(200);
+    expect(res.body.tiers).toHaveLength(3);
+    expect(res.body.tiers.map((t: { id: string }) => t.id)).toEqual([
+      'strong',
+      'possible',
+      'loose',
+    ]);
+    expect(res.body.tierCounts).toEqual({ strong: 1, possible: 0, loose: 0 });
+    expect(res.body.tiers[0].count).toBe(1);
+    expect(res.body.tiers[0].items).toHaveLength(1);
+    expect(res.body.tiers[0].items[0].match).toMatchObject({
+      percent: 100,
+      tier: 'strong',
+    });
+  });
+
+  it('tier= filtra la paginación a un tramo', async () => {
+    const strong = await request(baseUrl()).get('/api/search?q=cat&tier=strong&limit=1');
+    expect(strong.status).toBe(200);
+    expect(strong.body.tier).toBe('strong');
+    expect(strong.body.total).toBe(1);
+    expect(strong.body.grandTotal).toBe(1);
+    expect(strong.body.items.map((i: { id: string }) => i.id)).toEqual(['g1']);
+
+    const possible = await request(baseUrl()).get('/api/search?q=cat&tier=possible');
+    expect(possible.status).toBe(200);
+    expect(possible.body.tier).toBe('possible');
+    expect(possible.body.total).toBe(0);
+    expect(possible.body.items).toEqual([]);
+  });
 });
 
 describe('GET /api/search con modo semantic/hybrid', () => {
@@ -219,25 +267,38 @@ describe('GET /api/search con modo semantic/hybrid', () => {
     byId.delete('s2');
   });
 
-  it('hybrid fusiona el ranking léxico con el semántico vía RRF', async () => {
+  it('hybrid une el feed léxico con el semántico y ordena por % de match', async () => {
     // lexical = ['g1'] (mockScoreSearch). Semántico: g1 (cos 1), s1 (cos ~0.99).
     const res = await request(baseUrl()).get('/api/search?q=car&mode=hybrid');
     expect(res.status).toBe(200);
     expect(res.body.mode).toBe('hybrid');
     expect(sem.getSemanticIndex).toHaveBeenCalled();
     expect(sem.embedQuery).toHaveBeenCalledWith('car');
-    // RRF: g1 aparece en ambos rankings -> score compuesto mayor.
+    // g1 aparece en ambos feeds y tiene el coseno más alto.
     expect(res.body.items[0].id).toBe('g1');
-    // total = ranking RRF materializado, no el total léxico (fix de paginación).
+    expect(res.body.items[0].match).toMatchObject({
+      percent: 100,
+      tier: 'strong',
+      semanticPercent: 100,
+    });
     expect(res.body.total).toBe(2);
+    expect(res.body.tierCounts).toEqual({ strong: 2, possible: 0, loose: 0 });
   });
 
-  it('semantic usa solo el ranking por coseno y total = top-k materializado', async () => {
+  it('semantic puro usa el coseno y no cuela resultados solo-léxicos', async () => {
+    // Solo s1 tiene vector: g1 está en el feed léxico pero no en el semántico.
+    sem.getSemanticIndex.mockResolvedValue({
+      vectors: new Map([['s1', Float32Array.from([1, 0, 0, 0])]]),
+      model: 'bge-m3',
+      dim: 4,
+      builtAt: new Date(),
+    } as never);
+
     const res = await request(baseUrl()).get('/api/search?q=car&mode=semantic');
     expect(res.status).toBe(200);
     expect(res.body.mode).toBe('semantic');
-    expect(res.body.items.map((i: { id: string }) => i.id)).toEqual(['g1', 's1']);
-    expect(res.body.total).toBe(2);
+    expect(res.body.items.map((i: { id: string }) => i.id)).toEqual(['s1']);
+    expect(res.body.total).toBe(1);
   });
 
   it('degrade a lexical si el índice está vacío o Ollama no responde', async () => {

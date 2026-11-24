@@ -11,7 +11,6 @@ import { writeFile, unlink, readFile as readFileFs } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { promisify } from 'util';
-import { config } from './config';
 
 const execFileAsync = promisify(execFile);
 

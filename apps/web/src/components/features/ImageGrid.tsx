@@ -5,10 +5,10 @@ import { ImageCard } from './ImageCard';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { downloadFileName, saveBlobAs } from '@/lib/utils';
 import { downloadImage } from '@/services/api';
-import type { Image } from '@/types/image';
+import type { Image, SearchMatch } from '@/types/image';
 
 interface PageLike {
-  items: Image[];
+  items: Array<Image & { match?: SearchMatch }>;
 }
 
 interface Props {
@@ -70,6 +70,7 @@ export function ImageGrid({ pages, loading = false, loadingMore = false }: Props
               image={image}
               index={idxInPage}
               onDownload={triggerDownload}
+              match={image.match}
             />
           )),
         )}

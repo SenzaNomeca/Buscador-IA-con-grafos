@@ -101,6 +101,8 @@ describe('applyDelta', () => {
     expect(snap.useCaseIndex.get('Social Media')!.has('img-new-1')).toBe(true);
     expect(snap.colorIndex.get('#7C5CFF')!.has('img-new-1')).toBe(true);
     expect(snap.textIndex.get('img-new-1')!.original.has('neon')).toBe(true);
+    // El IDF se reconstruye en applyDelta: el token nuevo queda indexado.
+    expect(snap.tokenDf.get('brand')).toBe(1);
 
     // El nuevo tag 'brand' aparece en stats.
     expect(snap.stats.tags.some((t) => t.tag === 'brand' && t.count === 1)).toBe(true);

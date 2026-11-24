@@ -10,7 +10,7 @@
  * Idempotente: mantiene un manifest con ETags procesados.
  * Solo re-procesa archivos nuevos o cambiados.
  */
-import { mkdir, readFile, writeFile } from 'fs/promises';
+import { readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import {
   ListObjectsV2Command,

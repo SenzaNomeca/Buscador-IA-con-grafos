@@ -22,6 +22,67 @@ export interface PaginatedImages {
   hasMore: boolean;
 }
 
+/** Tramos de coincidencia que devuelve /api/search. */
+export type SearchTier = 'strong' | 'possible' | 'loose';
+
+export interface MatchTerm {
+  term: string;
+  field:
+    | 'tag'
+    | 'tagToken'
+    | 'subject'
+    | 'style'
+    | 'mood'
+    | 'useCase'
+    | 'original'
+    | 'enhanced';
+  weight: number;
+}
+
+export interface SearchMatch {
+  /** Coincidencia 0-100 (no es una probabilidad). */
+  percent: number;
+  tier: SearchTier;
+  /** Nº de términos de la búsqueda encontrados. */
+  matched: number;
+  /** Nº total de términos significativos de la búsqueda. */
+  queryTerms?: number;
+  /** Cobertura IDF 0-1 (útil para depurar; no se muestra como %). */
+  coverage?: number;
+  /** Términos encontrados en campos curados (tag, sujeto, estilo, mood, uso). */
+  coreMatched?: number;
+  /** Algún término encontrado es poco frecuente, o hay un tag exacto. */
+  distinctive?: boolean;
+  /** Todos los términos coinciden en el mismo tag/campo curado. */
+  cohesive?: boolean;
+  terms: MatchTerm[];
+  /** Similitud semántica 0-100 (solo en semantic/hybrid). */
+  semanticPercent?: number;
+}
+
+/** Item de búsqueda: la imagen + el detalle de coincidencia. */
+export interface SearchItem extends Image {
+  match: SearchMatch;
+}
+
+export interface TierCounts {
+  strong: number;
+  possible: number;
+  loose: number;
+}
+
+export interface SearchTierSlice {
+  id: SearchTier;
+  label: string;
+  min: number;
+  max: number;
+  count: number;
+  page: number;
+  limit: number;
+  hasMore: boolean;
+  items: SearchItem[];
+}
+
 export interface FilterValue {
   value: string;
   count: number;

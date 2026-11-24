@@ -1,7 +1,5 @@
-import { Pool, QueryResult, QueryConfig } from 'pg';
+import { Pool, QueryResult } from 'pg';
 import { config } from './config';
-
-type QueryParams = string | QueryConfig;
 
 let _pool: Pool | null = null;
 
@@ -95,7 +93,7 @@ function buildItems(rows: ImageRow[], sql: string, _params?: unknown[]): ImageRo
 
   // ORDER BY created_at DESC, id DESC
   if (sql.includes('ORDER BY')) {
-    cols.sort((a: any, b: any) => {
+    cols.sort((a, b) => {
       const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
       const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
       if (bTime !== aTime) return bTime - aTime;
@@ -177,12 +175,12 @@ async function mockQuery(sql: string, params?: unknown[]): Promise<QueryResult> 
   if (lower.includes('where')) {
     const matched = matchWhere(lower, params);
     const built = buildItems(matched, lower, params);
-    const { items, total } = paginate(built, lower);
+    const { items } = paginate(built, lower);
     return { rows: items, rowCount: items.length, command: 'SELECT' } as QueryResult;
   }
 
   // General SELECT without WHERE (listing)
   const built = buildItems([...getImageRows()], lower, params);
-  const { items, total } = paginate(built, lower);
+  const { items } = paginate(built, lower);
   return { rows: items, rowCount: items.length, command: 'SELECT' } as QueryResult;
 }

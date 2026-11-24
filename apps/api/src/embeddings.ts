@@ -7,7 +7,8 @@
  * - `embedQuery()`: texto de consulta → vector vía Ollama local (/api/embed),
  *   con cache LRU y fail-open (devuelve null si Ollama no responde).
  * - `searchSemantic()`: top-k por coseno contra el índice.
- * - `rrfFuse()`: Reciprocal Rank Fusion para el modo hybrid.
+ * - `rrfFuse()`: Reciprocal Rank Fusion (legado, testeado; la ruta de búsqueda
+ *   ya no lo usa: hybrid toma el máximo entre metadata y coseno).
  *
  * En modo mock (config.mock) el índice está vacío y el embedding se degrada a
  * lexical — el API sigue funcionando sin Ollama ni tabla.
@@ -223,6 +224,9 @@ export interface RankedResult {
  * Reciprocal Rank Fusion: combina los rankings léxico y semántico tomando la
  * unión de top-k de cada uno y sumando 1/(60+rank) por lista donde aparezca.
  * k = zona de confianza del RRF (60 es el clásico).
+ *
+ * Legado: se conserva exportado y testeado, pero `/api/search` ya no lo usa.
+ * El modo hybrid actual fusiona por `max(metadataPercent, cosinePercent)`.
  */
 export function rrfFuse(
   lexical: { id: string }[],

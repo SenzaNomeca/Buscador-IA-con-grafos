@@ -30,6 +30,8 @@ import Graph from 'graphology';
 import louvain from 'graphology-communities-louvain';
 import type { ImageRow } from './types';
 import { meaningfulTerms } from './stopwords';
+import { COLOR_TERMS, expandTerm } from './synonyms';
+import { config } from './config';
 
 // ── Tipos de apoyo ──────────────────────────────────────────────────────────
 
@@ -69,6 +71,8 @@ export interface GraphSnapshot {
   colorIndex: Map<string, Set<string>>;
   /** Índice de texto por imagen: tokens precomputados por campo (Sets rápidos). */
   textIndex: Map<string, TextTokens>;
+  /** Frecuencia documental por token: en cuántas imágenes aparece (cualquier campo). */
+  tokenDf: Map<Token, number>;
   /** Pesos de co-ocurrencia entre tags: `tagA → tagB → weight`. */
   coWeights: Map<string, Map<string, number>>;
   /** Lista global ordenada `created_at DESC, id DESC`. */
@@ -117,42 +121,552 @@ function tokenize(text: string): Token[] {
  * - "gato" → ["gato", "gatos"]   (agrega 's')
  * - "categorías" → ["categoria", "categorias"]  (retira 'es' y 's')
  * Solo trabaja con tokens de al menos 3 chars.
+ *
+ * Cache: scoreSearch recorre ~53k filas y reutiliza los mismos términos de la
+ * query; sin cache se generarían millones de Sets/arrays por request.
  */
+const pluralCache = new Map<Token, Token[]>();
+
 function pluralVariants(token: Token): Token[] {
+  const cached = pluralCache.get(token);
+  if (cached) return cached;
+
   const variants = new Set<Token>([token]);
-  if (token.length < 3) return [...variants];
+  if (token.length >= 3) {
+    // Retira trailing 's'/'es' (backward: plural → singular)
+    if (token.endsWith('s') && !token.endsWith('es')) {
+      variants.add(token.slice(0, -1));
+    } else if (token.endsWith('es') && token.length > 4) {
+      variants.add(token.slice(0, -2));
+    }
 
-  // Retira trailing 's'/'es' (backward: plural → singular)
-  if (token.endsWith('s') && !token.endsWith('es')) {
-    variants.add(token.slice(0, -1));
-  } else if (token.endsWith('es') && token.length > 4) {
-    variants.add(token.slice(0, -2));
+    // Agrega trailing 's' (forward: singular → plural)
+    if (!token.endsWith('s')) {
+      variants.add(token + 's');
+    }
   }
 
-  // Agrega trailing 's' (forward: singular → plural)
-  if (!token.endsWith('s')) {
-    variants.add(token + 's');
-  }
-
-  return [...variants];
-}
-
-/**
- * Verifica si un token coincide con un conjunto de tokens de referencia,
- * considerando plurales mínimos. Recibe Set para evitar reconstruirlo por término.
- */
-function tokenMatches(term: Token, referenceTokens: Set<Token>): boolean {
-  for (const variant of pluralVariants(term)) {
-    if (referenceTokens.has(variant)) return true;
-  }
-  return false;
+  const result = [...variants];
+  if (pluralCache.size > 5000) pluralCache.clear();
+  pluralCache.set(token, result);
+  return result;
 }
 
 /** Tokens precomputados por imagen/config para search (pesos por campo). */
 export interface TextTokens {
+  /** Tags completos normalizados (frases con espacios) para match exacto. */
+  tagPhrases: Set<Token>;
+  /** Tokens individuales de todos los tags (soporta tags multi-palabra). */
+  tags: Set<Token>;
   subject: Set<Token>;
+  style: Set<Token>;
+  mood: Set<Token>;
+  useCase: Set<Token>;
   original: Set<Token>;
   enhanced: Set<Token>;
+}
+
+/** Normaliza un texto a frase: tokens normalizados unidos por un espacio. */
+export function normalizePhrase(text: string): Token {
+  return tokenize(text).join(' ');
+}
+
+/** Construye los tokens de búsqueda de una fila (sin depender del snapshot). */
+export function buildTextTokens(row: ImageRow): TextTokens {
+  const tagPhrases = new Set<Token>();
+  const tags = new Set<Token>();
+  for (const tag of row.tags ?? []) {
+    if (!tag || tag.trim() === '') continue;
+    const phrase = normalizePhrase(tag);
+    if (phrase) tagPhrases.add(phrase);
+    for (const token of tokenize(tag)) tags.add(token);
+  }
+  return {
+    tagPhrases,
+    tags,
+    subject: new Set(row.subject ? tokenize(row.subject) : []),
+    style: new Set(row.style ? tokenize(row.style) : []),
+    mood: new Set(row.mood ? tokenize(row.mood) : []),
+    useCase: new Set(row.use_case ? tokenize(row.use_case) : []),
+    original: new Set(row.original_prompt ? tokenize(row.original_prompt) : []),
+    enhanced: new Set(row.enhanced_prompt ? tokenize(row.enhanced_prompt) : []),
+  };
+}
+
+/**
+ * Frecuencia documental por token a partir de un índice de texto.
+ * Un token cuenta una sola vez por imagen, aunque aparezca en varios campos.
+ */
+export function buildTokenDf(textTokens: Iterable<TextTokens>): Map<Token, number> {
+  const df = new Map<Token, number>();
+  const seen = new Set<Token>();
+
+  for (const toks of textTokens) {
+    seen.clear();
+    for (const set of [
+      toks.tags,
+      toks.subject,
+      toks.style,
+      toks.mood,
+      toks.useCase,
+      toks.original,
+      toks.enhanced,
+    ]) {
+      for (const token of set) seen.add(token);
+    }
+    for (const token of seen) df.set(token, (df.get(token) ?? 0) + 1);
+  }
+
+  return df;
+}
+
+/** IDF suavizado: términos frecuentes pesan poco, términos raros pesan más. */
+export function idfFromDf(
+  df: ReadonlyMap<Token, number> | undefined,
+  total: number,
+  token: Token,
+): number {
+  const docs = df?.get(token) ?? 0;
+  return Math.log((total + 1) / (docs + 1)) + 1;
+}
+
+/** Función IDF lista para pasar a `computeMetadataMatch`. */
+export function makeIdf(snap: GraphSnapshot): (token: Token) => number {
+  return (token) => idfFromDf(snap.tokenDf, snap.byId.size, token);
+}
+
+/**
+ * Un término es distintivo cuando aparece en una porción muy pequeña del
+ * catálogo. Los matches parciales de una query multi-término solo se muestran
+ * si aportan al menos un término distintivo; así "fondo" (muy frecuente) no
+ * llena la búsqueda de "fondo blanco", pero "sonrisa" o "abogado" sí pueden
+ * sostener un match parcial.
+ */
+export function makeDistinctiveFromDf(
+  df: ReadonlyMap<Token, number> | undefined,
+  total: number,
+): (token: Token) => boolean {
+  const maxDf = Math.max(
+    config.search.distinctiveMinDf,
+    Math.ceil(total * config.search.distinctiveDfRatio),
+  );
+  return (token) => {
+    // Se mira la familia morfológica (fondo/fondos, gato/gatos): si cualquier
+    // forma es frecuente, el concepto no es distintivo.
+    let docs = 0;
+    for (const variant of pluralVariants(token)) {
+      const variantDf = df?.get(variant) ?? 0;
+      if (variantDf > docs) docs = variantDf;
+    }
+    return docs > 0 && docs <= maxDf;
+  };
+}
+
+export function makeDistinctive(snap: GraphSnapshot): (token: Token) => boolean {
+  return makeDistinctiveFromDf(snap.tokenDf, snap.byId.size);
+}
+
+/**
+ * Variantes de un término: plural mínimo + sinónimos curados. Se cachea porque
+ * `scoreSearch` recorre todo el catálogo y reutiliza los mismos términos.
+ */
+const queryVariantsCache = new Map<Token, Token[]>();
+
+function queryVariants(term: Token): Token[] {
+  const cached = queryVariantsCache.get(term);
+  if (cached) return cached;
+
+  const variants = new Set<Token>();
+  for (const base of expandTerm(term)) {
+    for (const variant of pluralVariants(base)) variants.add(variant);
+  }
+  const result = [...variants];
+  if (queryVariantsCache.size > 5000) queryVariantsCache.clear();
+  queryVariantsCache.set(term, result);
+  return result;
+}
+
+/** Primer token de `variants` presente en `reference`, o null. */
+function findVariant(variants: Token[], reference: Set<Token>): Token | null {
+  for (const variant of variants) {
+    if (reference.has(variant)) return variant;
+  }
+  return null;
+}
+
+/**
+ * Tokens de una frase de tag, cacheados. La cohesión usa cuántos términos de
+ * la query comparten un mismo tag: "fondo-azul" + "mesa-blanca" no debe
+ * puntuar como "fondo blanco".
+ */
+const phraseTokensCache = new Map<Token, Set<Token>>();
+
+function phraseTokens(phrase: Token): Set<Token> {
+  const cached = phraseTokensCache.get(phrase);
+  if (cached) return cached;
+  const tokens = new Set<Token>(phrase.split(' ').filter(Boolean));
+  if (phraseTokensCache.size > 50_000) phraseTokensCache.clear();
+  phraseTokensCache.set(phrase, tokens);
+  return tokens;
+}
+
+/**
+ * Máximo de términos de la query que aparecen juntos en un mismo tag.
+ * Ej.: query de 3 términos con tag "fondo panel blanco" + tag "minimalista"
+ * da 2; query de 2 términos con "fondo-azul" + "mesa-blanca" da 1.
+ */
+function maxTagCoverage(toks: TextTokens, variantsByTerm: Token[][]): number {
+  let best = 0;
+  for (const phrase of toks.tagPhrases) {
+    const tokens = phraseTokens(phrase);
+    let count = 0;
+    for (const variants of variantsByTerm) {
+      if (variants.some((v) => tokens.has(v))) count++;
+    }
+    if (count > best) best = count;
+  }
+  return best;
+}
+
+/** ¿Los dos términos aparecen juntos en alguna frase de tag? */
+function sharesTag(
+  toks: TextTokens,
+  variantsA: Token[],
+  variantsB: Token[],
+): boolean {
+  for (const phrase of toks.tagPhrases) {
+    const tokens = phraseTokens(phrase);
+    if (
+      variantsA.some((v) => tokens.has(v)) &&
+      variantsB.some((v) => tokens.has(v))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Un color debe estar pegado al sustantivo que califica. En español el
+ * adjetivo suele ir después, así que se exige que comparta tag con el término
+ * anterior no-color ("fondo blanco", "traje azul", "flores rojas"). Sin esto,
+ * "fondo" + "rectángulos blancos" + "minimalista" parecería un fondo blanco.
+ */
+function colorsCohere(
+  toks: TextTokens,
+  terms: string[],
+  variantsByTerm: Token[][],
+): boolean {
+  for (let i = 0; i < terms.length; i++) {
+    if (!COLOR_TERMS.has(terms[i])) continue;
+
+    let neighbor = -1;
+    for (let j = i - 1; j >= 0; j--) {
+      if (!COLOR_TERMS.has(terms[j])) {
+        neighbor = j;
+        break;
+      }
+    }
+    if (neighbor === -1) {
+      for (let j = i + 1; j < terms.length; j++) {
+        if (!COLOR_TERMS.has(terms[j])) {
+          neighbor = j;
+          break;
+        }
+      }
+    }
+    // Query compuesta solo por colores ("blanco y negro"): no hay sustantivo
+    // que exigir; la cohesión normal decide.
+    if (neighbor === -1) continue;
+    if (!sharesTag(toks, variantsByTerm[i], variantsByTerm[neighbor])) return false;
+  }
+  return true;
+}
+
+// ── Coincidencia por metadatos (búsqueda por tramos) ────────────────────────
+
+export type SearchTier = 'strong' | 'possible' | 'loose';
+
+/** Campo donde se encontró un término de la búsqueda. */
+export type MatchField =
+  | 'tag'
+  | 'tagToken'
+  | 'subject'
+  | 'style'
+  | 'mood'
+  | 'useCase'
+  | 'original'
+  | 'enhanced';
+
+export interface MatchTerm {
+  term: string;
+  field: MatchField;
+  /** Peso del campo: 1.00 es la coincidencia más fuerte. */
+  weight: number;
+}
+
+export interface MatchInfo {
+  /** Cobertura ponderada 0-100 (no es una probabilidad). */
+  percent: number;
+  tier: SearchTier;
+  /** Nº de términos significativos encontrados. */
+  matched: number;
+  /** Nº total de términos significativos de la query. */
+  queryTerms: number;
+  /** Cobertura IDF 0-1 de los términos encontrados (para depurar/ordenar). */
+  coverage: number;
+  /** Nº de términos encontrados en campos curados (tag/subject/style/mood/useCase). */
+  coreMatched: number;
+  /** Algún término encontrado es poco frecuente, o hay un tag exacto. */
+  distinctive: boolean;
+  /** Evidencia cohesionada (mismo campo/tag, término distintivo o color+sustantivo). */
+  cohesive: boolean;
+  terms: MatchTerm[];
+  /**
+   * Similitud semántica 0-100 cuando la respuesta viene de semantic/hybrid.
+   * Si supera el % de metadatos, `percent` toma este valor.
+   */
+  semanticPercent?: number;
+}
+
+/**
+ * Pesos por campo. El tag es metadata curada y el prompt es texto generado:
+ * un match en tag vale más que uno en prompt. Ajustar acá si cambia el criterio.
+ */
+export const MATCH_FIELD_WEIGHTS: Record<MatchField, number> = {
+  tag: 1,
+  tagToken: 0.95,
+  subject: 0.9,
+  style: 0.85,
+  mood: 0.85,
+  useCase: 0.85,
+  original: 0.65,
+  enhanced: 0.6,
+};
+
+/** Tramo al que pertenece un porcentaje (límites configurables por env). */
+export function tierFor(percent: number): SearchTier {
+  if (percent >= config.search.tierStrong) return 'strong';
+  if (percent >= config.search.tierPossible) return 'possible';
+  return 'loose';
+}
+
+/** Campos curados: pesan más y son requisito para el tramo strong. */
+const CORE_FIELDS: ReadonlySet<MatchField> = new Set([
+  'tag',
+  'tagToken',
+  'subject',
+  'style',
+  'mood',
+  'useCase',
+]);
+
+export interface MetadataMatchOptions {
+  /** Peso IDF por token; por defecto todos pesan igual (1). */
+  idf?: (token: Token) => number;
+  /** Define si un token es poco frecuente y sostiene un match parcial. */
+  isDistinctive?: (token: Token) => boolean;
+}
+
+function metadataTier(percent: number, termCount: number, coreMatched: number): SearchTier {
+  if (termCount <= 1) return tierFor(percent);
+  // Strong exige que TODOS los términos estén en campos curados. Un prompt
+  // puede completar cobertura, pero nunca convertir un resultado en strong.
+  if (percent >= config.search.tierStrong && coreMatched === termCount) return 'strong';
+  if (percent >= config.search.tierPossible) return 'possible';
+  return 'loose';
+}
+
+/**
+ * Calcula la coincidencia de una imagen contra los términos de la búsqueda.
+ *
+ * `percent = cobertura * calidad`, donde:
+ * - cobertura = IDF de los términos encontrados / IDF de todos los términos
+ * - calidad   = promedio del peso del mejor campo de cada término encontrado
+ *
+ * El IDF evita que términos genéricos ("fondo", "persona") "completen" una
+ * query multi-término con poco esfuerzo. La cobertura se calcula sobre evidencia
+ * real (incluye sinónimos/plurales), no sobre el número de tokens de la query.
+ *
+ * Es una medida explicable de "cuánto de lo buscado aparece en los metadatos",
+ * no una probabilidad. Los tags con tilde/mayúscula y los multi-palabra se
+ * comparan ya normalizados.
+ */
+export function computeMetadataMatch(
+  toks: TextTokens,
+  terms: string[],
+  queryPhrase: string = terms.join(' '),
+  opts: MetadataMatchOptions = {},
+): MatchInfo {
+  if (terms.length === 0) {
+    return {
+      percent: 0,
+      tier: 'loose',
+      matched: 0,
+      queryTerms: 0,
+      coverage: 0,
+      coreMatched: 0,
+      distinctive: false,
+      cohesive: false,
+      terms: [],
+    };
+  }
+
+  const idf = opts.idf ?? (() => 1);
+  const isDistinctive = opts.isDistinctive ?? (() => false);
+  const exactTagPhrase = queryPhrase !== '' && toks.tagPhrases.has(queryPhrase);
+  const totalIdf = terms.reduce((sum, term) => sum + idf(term), 0);
+  const variantsByTerm = terms.map(queryVariants);
+
+  let qualitySum = 0;
+  let matchedIdf = 0;
+  let matched = 0;
+  let coreMatched = 0;
+  let distinctive = exactTagPhrase;
+  const matchedTerms: MatchTerm[] = [];
+
+  for (let i = 0; i < terms.length; i++) {
+    const term = terms[i];
+    const variants = variantsByTerm[i];
+    let bestWeight = 0;
+    let bestField: MatchField | null = null;
+    let bestToken: Token | null = null;
+
+    const consider = (field: MatchField, weight: number, token: Token): void => {
+      if (weight > bestWeight) {
+        bestWeight = weight;
+        bestField = field;
+        bestToken = token;
+      }
+    };
+
+    // Tags: frase exacta > tag de una palabra > token dentro de tag multi-palabra.
+    if (exactTagPhrase) {
+      const tagToken = findVariant(variants, toks.tags);
+      if (tagToken) consider('tag', MATCH_FIELD_WEIGHTS.tag, tagToken);
+    } else {
+      const phraseToken = findVariant(variants, toks.tagPhrases);
+      if (phraseToken) {
+        consider('tag', MATCH_FIELD_WEIGHTS.tag, phraseToken);
+      } else {
+        const tagToken = findVariant(variants, toks.tags);
+        if (tagToken) consider('tagToken', MATCH_FIELD_WEIGHTS.tagToken, tagToken);
+      }
+    }
+
+    // Los campos están en orden de peso: si un término ya matcheó en tag
+    // (1.00/0.95), los campos inferiores no pueden mejorar el resultado.
+    if (bestWeight < MATCH_FIELD_WEIGHTS.subject) {
+      const subjectToken = findVariant(variants, toks.subject);
+      if (subjectToken) consider('subject', MATCH_FIELD_WEIGHTS.subject, subjectToken);
+    }
+    if (bestWeight < MATCH_FIELD_WEIGHTS.style) {
+      const styleToken = findVariant(variants, toks.style);
+      if (styleToken) consider('style', MATCH_FIELD_WEIGHTS.style, styleToken);
+      const moodToken = findVariant(variants, toks.mood);
+      if (moodToken) consider('mood', MATCH_FIELD_WEIGHTS.mood, moodToken);
+      const useCaseToken = findVariant(variants, toks.useCase);
+      if (useCaseToken) consider('useCase', MATCH_FIELD_WEIGHTS.useCase, useCaseToken);
+    }
+    if (bestWeight < MATCH_FIELD_WEIGHTS.original) {
+      const originalToken = findVariant(variants, toks.original);
+      if (originalToken) consider('original', MATCH_FIELD_WEIGHTS.original, originalToken);
+    }
+    if (bestWeight < MATCH_FIELD_WEIGHTS.enhanced) {
+      const enhancedToken = findVariant(variants, toks.enhanced);
+      if (enhancedToken) consider('enhanced', MATCH_FIELD_WEIGHTS.enhanced, enhancedToken);
+    }
+
+    if (bestField !== null && bestToken !== null) {
+      matched++;
+      qualitySum += bestWeight;
+      // La cobertura pondera el término de la QUERY, no la variante que lo
+      // encontró: así "gato" → tag "gatos" no se penaliza como término ausente,
+      // y un sinónimo ("sonriendo" → "sonrisa") cuenta como el término pedido.
+      matchedIdf += idf(term);
+      if (CORE_FIELDS.has(bestField)) coreMatched++;
+      // La rareza se mide sobre el término de la query, no sobre la variante
+      // morfológica encontrada: "fondo" no se vuelve específico porque el tag
+      // diga "fondos".
+      if (isDistinctive(term)) distinctive = true;
+      matchedTerms.push({ term, field: bestField, weight: bestWeight });
+    }
+  }
+
+  if (matched === 0) {
+    return {
+      percent: 0,
+      tier: 'loose',
+      matched: 0,
+      queryTerms: terms.length,
+      coverage: 0,
+      coreMatched: 0,
+      distinctive: false,
+      cohesive: false,
+      terms: [],
+    };
+  }
+
+  const coverage = totalIdf > 0 ? Math.min(1, matchedIdf / totalIdf) : 0;
+  const quality = qualitySum / matched;
+  let percent = Math.round(100 * coverage * quality);
+
+  // Cohesión: para ser "strong", los términos deben aparecer juntos en un mismo
+  // tag o en un mismo campo curado. Coincidir por separado en tags distintos
+  // ("fondo-azul" + "mesa-blanca") no es lo mismo que "fondo blanco".
+  const allTermsInTags = variantsByTerm.every(
+    (variants) => findVariant(variants, toks.tags) !== null,
+  );
+  const tagCoverage =
+    matched === terms.length && terms.length > 1 ? maxTagCoverage(toks, variantsByTerm) : 0;
+  const cohesive =
+    matched === terms.length &&
+    (terms.length <= 1 ||
+      exactTagPhrase ||
+      [toks.subject, toks.style, toks.mood, toks.useCase].some((field) =>
+        variantsByTerm.every((variants) => findVariant(variants, field) !== null),
+      ) ||
+      // Si hay un término específico, que todos estén en tags (aunque sean
+      // tags distintos) es evidencia suficiente. Con solo términos genéricos
+      // exigimos que casi todos compartan un mismo tag: "fondo-azul" +
+      // "mesa-blanca" (cobertura 1/2) no pasa, pero "fondo panel blanco" +
+      // "minimalista" (cobertura 2/3) sí. Los colores, además, deben compartir
+      // tag con el sustantivo que califican.
+      (allTermsInTags &&
+        colorsCohere(toks, terms, variantsByTerm) &&
+        (distinctive || tagCoverage >= Math.max(2, terms.length - 1))));
+
+  // El % y el tramo deben ser coherentes con las reglas de evidencia:
+  // - prompt-only multi-término no puede ser "possible" (se queda en loose);
+  // - si falta algún término curado o no hay cohesión, no puede ser "strong".
+  if (terms.length > 1) {
+    if (coreMatched === 0) {
+      percent = Math.min(percent, config.search.tierPossible - 1);
+    } else if (coreMatched < terms.length || !cohesive) {
+      percent = Math.min(percent, config.search.tierStrong - 1);
+    }
+  }
+
+  return {
+    percent,
+    tier: metadataTier(percent, terms.length, coreMatched),
+    matched,
+    queryTerms: terms.length,
+    coverage,
+    coreMatched,
+    distinctive,
+    cohesive,
+    terms: matchedTerms,
+  };
+}
+
+/**
+ * Un match multi-término parcial solo entra si aporta un término distintivo.
+ * Los matches completos (todos los términos) y las queries de un término pasan
+ * siempre el filtro; el piso de `percent` se valida aparte.
+ */
+export function passesMetadataFilter(match: MatchInfo): boolean {
+  return match.queryTerms <= 1 || match.matched >= match.queryTerms || match.distinctive;
 }
 
 // ── Construcción del grafo ──────────────────────────────────────────────────
@@ -431,11 +945,7 @@ function addRowToBuilder(b: SnapshotBuilder, row: ImageRow): void {
   }
 
   // Texto tokenizado por campo para search (Sets precomputados, sin re-tokenizar).
-  b.textIndex.set(row.id, {
-    subject: new Set(row.subject ? tokenize(row.subject) : []),
-    original: new Set(row.original_prompt ? tokenize(row.original_prompt) : []),
-    enhanced: new Set(row.enhanced_prompt ? tokenize(row.enhanced_prompt) : []),
-  });
+  b.textIndex.set(row.id, buildTextTokens(row));
 }
 
 /** (Re)crea las aristas CO_OCCURS_WITH a partir de los pesos acumulados. */
@@ -498,6 +1008,7 @@ function finalizeSnapshot(b: SnapshotBuilder, t0: number): GraphSnapshot {
     useCaseIndex: b.useCaseIndex,
     colorIndex: b.colorIndex,
     textIndex: b.textIndex,
+    tokenDf: buildTokenDf(b.textIndex.values()),
     coWeights: b.coWeights,
     orderedIds,
     topByDegree,
@@ -524,17 +1035,17 @@ export interface SearchResult {
 }
 
 /**
- * Búsqueda por token-match con ranking por cobertura.
+ * Búsqueda por token-match con ranking por cobertura ponderada por IDF.
  *
- * Cada término de la query se compara como palabra completa (con plural mínimo)
- * contra tags, subject, original_prompt y enhanced_prompt. El score suma por
- * término encontrado (tags tienen más peso que el texto) y el resultado se
- * ordena por score DESC.
+ * Cada término de la query se compara (con plural y sinónimos curados) contra
+ * tags, subject, style, mood, use_case y prompts. El % combina la cobertura
+ * (cuánto de lo buscado aparece) con la calidad del campo (tag > subject >
+ * prompt). Los términos muy frecuentes pesan menos, y un match parcial de una
+ * query multi-término solo entra si aporta algún término distintivo.
  *
- * Para queries cortas (1-3 términos) basta con que UN término coincida (comporta
- * OR, como el SQL original). Para párrafos/queries largas se exige un porcentaje
- * mínimo de términos coincidentes (coverage), de modo que solo vuelven imágenes
- * realmente relevantes y no cualquier imagen que comparta una palabra suelta.
+ * Para queries de un término se mantiene el comportamiento OR: si el término
+ * aparece, se devuelve. Para queries multi-término se prioriza el match completo
+ * y se descartan los parciales genéricos que antes llenaban los tramos bajos.
  */
 export function search(
   snap: GraphSnapshot,
@@ -559,73 +1070,86 @@ export function search(
   };
 }
 
+export interface ScoredSearchItem extends MatchInfo {
+  id: string;
+  /**
+   * Suma de pesos de los términos encontrados. Se usa como desempate cuando dos
+   * imágenes tienen el mismo `percent` (más términos encontrados gana).
+   */
+  score: number;
+}
+
+export interface TierCounts {
+  strong: number;
+  possible: number;
+  loose: number;
+}
+
 export interface ScoredSearch {
-  /** Ids rankeados (score DESC, created_at DESC, id DESC), ya filtrados por minMatched. */
+  /** Entradas rankeadas por coincidencia (percent DESC, score DESC, fecha DESC). */
+  entries: ScoredSearchItem[];
+  /** Compatibilidad: ids en el mismo orden que `entries`. */
   ids: string[];
   total: number;
+  tierCounts: TierCounts;
+}
+
+function emptyScoredSearch(): ScoredSearch {
+  return {
+    entries: [],
+    ids: [],
+    total: 0,
+    tierCounts: { strong: 0, possible: 0, loose: 0 },
+  };
 }
 
 /**
- * Igual que `search` pero devuelve solo el ranking de ids, sin paginar.
- * Sirve como input para el modo hybrid (RRF fusiona ranking léxico + semántico).
+ * Búsqueda léxica/metadata por coincidencia ponderada.
+ *
+ * Devuelve todos los resultados por encima de `SEARCH_MATCH_FLOOR`, agrupables
+ * en tres tramos. Los tokens por campo vienen precomputados en `textIndex`, así
+ * que no se re-tokeniza por request.
  */
 export function scoreSearch(
   snap: GraphSnapshot,
   q: string,
   opts: { page?: number; limit?: number; minMatched?: number; topK?: number } = {},
 ): ScoredSearch {
-  if (!q.trim()) {
-    return { ids: [], total: 0 };
-  }
+  if (!q.trim()) return emptyScoredSearch();
 
-  // Términos significativos (sin stopwords), en minúsculas y sin duplicados.
-  // Las stopwords no cuentan para la cobertura: "persona parada frente a una
-  // sala de control" solo exige match sobre persona/parada/sala/control.
+  // Términos significativos normalizados (sin stopwords, sin tildes/puntuación).
   const terms = meaningfulTerms(q);
+  // Frase normalizada para detectar un tag multi-palabra exacto.
+  const queryPhrase = normalizePhrase(q);
+  const minMatched = opts.minMatched ?? 1;
+  const floor = config.search.floor;
+  const idf = makeIdf(snap);
+  const isDistinctive = makeDistinctive(snap);
 
-  // Cobertura mínima: queries cortas (≤2 términos) → cualquier match;
-  // párrafos → ≥ 75% de los términos significativos. El 75% pide ~toda la
-  // frase ("persona parada frente a sala de control" = 4 términos → exige 3),
-  // lo que descarta matches parciales tipo "sala de espera" (solo sala+persona).
-  const minMatched = opts.minMatched ?? (terms.length <= 2 ? 1 : Math.floor(terms.length * 0.75));
-
-  // Calcular score por cobertura para cada imagen.
-  // Los tokens por campo vienen precomputados en textIndex (Sets), así que no
-  // hay que re-tokenizar ni reconstruir Sets por request.
-  const scored: { id: string; score: number; matched: number }[] = [];
+  const entries: ScoredSearchItem[] = [];
+  const tierCounts: TierCounts = { strong: 0, possible: 0, loose: 0 };
 
   for (const [id, toks] of snap.textIndex) {
-    let score = 0;
-    let matched = 0;
+    if (!snap.byId.has(id)) continue;
 
-    for (const term of terms) {
-      let termScore = 0;
+    const match = computeMetadataMatch(toks, terms, queryPhrase, { idf, isDistinctive });
+    if (match.matched < minMatched || match.percent < floor) continue;
+    if (!passesMetadataFilter(match)) continue;
 
-      // Tags: coincidencia de palabra completa (con plural mínimo), peso alto.
-      const row = snap.byId.get(id)!;
-      if (row.tags?.some((t) => pluralVariants(term).includes(t))) {
-        termScore += 4;
-      }
-
-      // Texto: token-match sobre subject/prompt precomputado, peso menor.
-      if (tokenMatches(term, toks.subject)) termScore += 2;
-      if (tokenMatches(term, toks.original)) termScore += 1;
-      if (tokenMatches(term, toks.enhanced)) termScore += 1;
-
-      // Un término cuenta como un match aunque coincida en varios campos.
-      if (termScore > 0) {
-        matched++;
-        score += termScore;
-      }
-    }
-
-    if (matched >= minMatched) scored.push({ id, score, matched });
+    const score = match.terms.reduce((sum, t) => sum + t.weight, 0);
+    entries.push({ id, score, ...match });
+    tierCounts[match.tier]++;
   }
 
-  // Orden: score DESC, created_at DESC, id DESC.
-  scored.sort((a, b) => {
-    const cmp = b.score - a.score;
-    if (cmp !== 0) return cmp;
+  // Orden: coincidencia DESC, campos curados DESC, riqueza de campos DESC,
+  // fecha DESC, id DESC. La fecha queda al final: no debe decidir la relevancia.
+  entries.sort((a, b) => {
+    const cmpPercent = b.percent - a.percent;
+    if (cmpPercent !== 0) return cmpPercent;
+    const cmpCore = b.coreMatched - a.coreMatched;
+    if (cmpCore !== 0) return cmpCore;
+    const cmpScore = b.score - a.score;
+    if (cmpScore !== 0) return cmpScore;
     const rowA = snap.byId.get(a.id)!;
     const rowB = snap.byId.get(b.id)!;
     const cmpDate = String(rowB.created_at).localeCompare(String(rowA.created_at));
@@ -633,11 +1157,22 @@ export function scoreSearch(
     return b.id.localeCompare(a.id);
   });
 
-  const ids = scored.map((s) => s.id);
-  if (opts.topK && opts.topK > 0 && ids.length > opts.topK) {
-    return { ids: ids.slice(0, opts.topK), total: scored.length };
+  if (opts.topK && opts.topK > 0 && entries.length > opts.topK) {
+    const top = entries.slice(0, opts.topK);
+    return {
+      entries: top,
+      ids: top.map((e) => e.id),
+      total: entries.length,
+      tierCounts,
+    };
   }
-  return { ids, total: scored.length };
+
+  return {
+    entries,
+    ids: entries.map((e) => e.id),
+    total: entries.length,
+    tierCounts,
+  };
 }
 
 // ── Related ─────────────────────────────────────────────────────────────────
@@ -829,23 +1364,6 @@ const NODE_COLORS: Record<string, string> = {
   useCase: '#06b6d4', // cyan
   color: '#6b7280',   // gray
 };
-
-function nodeTypeFromKey(key: string): GraphNode['type'] | null {
-  if (key.startsWith(TAG)) return 'tag';
-  if (key.startsWith(STYLE)) return 'style';
-  if (key.startsWith(MOOD)) return 'mood';
-  if (key.startsWith(USE_CASE)) return 'useCase';
-  if (key.startsWith(COLOR)) return 'color';
-  // Si es un id de imagen (no tiene prefijo de metadatos).
-  return null; // es un nodo Image
-}
-
-function nodeLabelFromKey(key: string): string {
-  for (const prefix of [TAG, STYLE, MOOD, USE_CASE, COLOR]) {
-    if (key.startsWith(prefix)) return key.slice(prefix.length);
-  }
-  return key;
-}
 
 /** Opciones de exportación del grafo. */
 export interface ExportOptions {
@@ -1200,6 +1718,7 @@ export function applyDelta(snap: GraphSnapshot, newRows: ImageRow[]): void {
   const next = finalizeSnapshot(snap, t0);
   snap.orderedIds = next.orderedIds;
   snap.topByDegree = next.topByDegree;
+  snap.tokenDf = next.tokenDf;
   snap.stats = next.stats;
   snap.builtAt = next.builtAt;
   snap.buildMs = next.buildMs;

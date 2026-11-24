@@ -1,7 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { embedMetadata } from '../src/metadata';
 import { execFile } from 'child_process';
-import { promisify } from 'util';
 
 // Mock execFile to avoid calling real exiftool.
 vi.mock('child_process', () => ({
@@ -26,7 +25,7 @@ beforeEach(() => {
 
 describe('embedMetadata', () => {
   it('calls exiftool with correct args when all fields present', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], cb: any) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], cb: (err: Error | null, ..._rest: unknown[]) => void) => {
       cb(null, { stdout: '', stderr: '' });
     });
 
@@ -52,7 +51,7 @@ describe('embedMetadata', () => {
   });
 
   it('skips description/subject/tags when null', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], cb: any) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], cb: (err: Error | null, ..._rest: unknown[]) => void) => {
       cb(null, { stdout: '', stderr: '' });
     });
 
@@ -75,7 +74,7 @@ describe('embedMetadata', () => {
   });
 
   it('returns original buffer when exiftool fails', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], cb: any) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], cb: (err: Error | null, ..._rest: unknown[]) => void) => {
       cb(new Error('exiftool not found'), { stdout: '', stderr: '' });
     });
 
@@ -95,7 +94,7 @@ describe('embedMetadata', () => {
   it('returns original buffer when exiftool is missing (ENOENT)', async () => {
     const err = new Error('ENOENT') as NodeJS.ErrnoException;
     err.code = 'ENOENT';
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], cb: any) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], cb: (err: Error | null, ..._rest: unknown[]) => void) => {
       cb(err, { stdout: '', stderr: '' });
     });
 

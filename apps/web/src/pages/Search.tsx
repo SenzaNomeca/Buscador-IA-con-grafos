@@ -1,21 +1,20 @@
 import { useCallback, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { useInfiniteSearch, useSearchConfig } from '@/hooks/useImages';
-import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
-import { ImageGrid } from '@/components/features/ImageGrid';
+import { useSearchConfig, useSearchTiers } from '@/hooks/useImages';
+import { SearchTierSection } from '@/components/features/SearchTierSection';
 import { GraphCanvas } from '@/components/features/GraphCanvas';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { Spinner } from '@/components/ui/Spinner';
-import { Network } from 'lucide-react';
+import { AlertTriangle, Network } from 'lucide-react';
 import { isSearchMode, searchImages, type SearchMode } from '@/services/api';
 import { cn } from '@/lib/utils';
 
 const MODES: Array<{ id: SearchMode; label: string; hint: string }> = [
-  { id: 'lexical', label: 'Léxica', hint: 'coincidencia por tokens' },
+  { id: 'lexical', label: 'Léxica', hint: 'coincidencia exacta de metadatos' },
   { id: 'semantic', label: 'Semántica', hint: 'similitud por embeddings' },
-  { id: 'hybrid', label: 'Híbrida', hint: 'fusión de ambas (RRF)' },
+  { id: 'hybrid', label: 'Híbrida', hint: 'une léxica + semántica; gana el % más alto' },
 ];
 
 export function SearchPage() {
@@ -30,11 +29,17 @@ export function SearchPage() {
   const { data: health } = useSearchConfig();
   const activeMode = explicitMode ?? health?.search?.mode ?? 'hybrid';
 
-  const { data, isLoading, error, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } =
-    useInfiniteSearch(q, 24, explicitMode);
+  const {
+    data: grouped,
+    tiers,
+    isLoading,
+    error,
+    refetch,
+    loadError,
+  } = useSearchTiers(q, explicitMode);
 
   // Subgrafo de la búsqueda: se pide aparte (graph=1) cuando el usuario abre
-  // el toggle — el feed infinito no debería arrastrar el grafo en cada página.
+  // el toggle — el feed agrupado no debería arrastrar el grafo en cada request.
   const { data: graphResp, isFetching: graphLoading } = useQuery({
     queryKey: ['search', q, activeMode, 'graph'],
     queryFn: () =>
@@ -47,14 +52,8 @@ export function SearchPage() {
     enabled: showGraph && q.length > 0,
   });
 
-  const onLoadMore = useCallback(() => {
-    if (hasNextPage && !isFetchingNextPage) fetchNextPage();
-  }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
-
   const onPickMode = useCallback(
     (mode: SearchMode) => {
-      // Escribimos el modo en el URL (compartible y parte del queryKey) para
-      // que el toggle responda incluso antes de cargar /api/health.
       setParams({ q, mode }, { replace: true });
     },
     [setParams, q],
@@ -64,17 +63,13 @@ export function SearchPage() {
     setShowGraph((v) => !v);
   }, []);
 
-  const sentinelRef = useInfiniteScroll(onLoadMore, !!hasNextPage);
-
-  const pages = data?.pages ?? [];
-  const totalLoaded = pages.reduce((n, p) => n + p.items.length, 0);
-  const total = data?.pages[0]?.total ?? 0;
+  const total = grouped?.total ?? 0;
 
   if (!q) {
     return (
       <EmptyState
         title="Escribe algo para buscar"
-        description="La barra superior busca por sujeto, prompt y tags."
+        description="La barra superior busca en tags, sujeto, estilo, mood, uso y prompts."
       />
     );
   }
@@ -117,13 +112,19 @@ export function SearchPage() {
             {showGraph ? 'Ver resultados' : 'Ver grafo'}
           </button>
         </div>
+
+        <p className="mt-3 text-xs text-ink-faint">
+          El porcentaje combina la coincidencia de metadatos con la similitud semántica
+          según el modo elegido. No es una probabilidad.
+        </p>
       </header>
 
       {showGraph ? (
-        // Subgrafo inducido por el top-100 del ranking actual: imágenes (indigo)
-        // + metadatos que comparten (tags amber, estilos verde, moods morado…).
-        // El tamaño del metadato = cuántas imágenes de la búsqueda lo comparten.
-        <div className="relative rounded-2xl border border-white/5 bg-canvas-raised overflow-hidden" style={{ height: '70vh' }}>
+        // Subgrafo inducido por el top-100 del ranking actual.
+        <div
+          className="relative rounded-2xl border border-white/5 bg-canvas-raised overflow-hidden"
+          style={{ height: '70vh' }}
+        >
           {graphLoading && (
             <div className="absolute inset-0 z-10 flex items-center justify-center bg-canvas/80">
               <Spinner />
@@ -144,20 +145,27 @@ export function SearchPage() {
         </div>
       ) : error ? (
         <ErrorState message={(error as Error).message} onRetry={() => refetch()} />
-      ) : !isLoading && totalLoaded === 0 ? (
+      ) : isLoading ? (
+        <div className="flex justify-center py-16">
+          <Spinner />
+        </div>
+      ) : total === 0 ? (
         <EmptyState
           title="Sin coincidencias"
           description={`No encontramos imágenes para “${q}”. Prueba con términos más generales o cambia el modo.`}
         />
       ) : (
-        <ImageGrid pages={pages} loading={isLoading} loadingMore={isFetchingNextPage} />
-      )}
-
-      <div ref={sentinelRef} className="h-10" />
-      {isFetchingNextPage && (
-        <div className="flex justify-center py-6">
-          <Spinner />
-        </div>
+        <>
+          {loadError && (
+            <div className="mb-6 flex items-center gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-red-400" aria-hidden />
+              <span>{loadError}</span>
+            </div>
+          )}
+          {tiers.map((tier) => (
+            <SearchTierSection key={tier.id} tier={tier} />
+          ))}
+        </>
       )}
     </div>
   );

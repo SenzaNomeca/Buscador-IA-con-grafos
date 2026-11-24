@@ -11,14 +11,9 @@
  */
 import { readdir, readFile } from 'fs/promises';
 import { join, extname } from 'path';
-import { readImageMetadata, checkExiftool } from '../metadata';
-import { graphStore, type GraphSnapshot } from '../graph';
+import { readImageMetadata, checkExiftool, type ReadMetadataResult } from '../metadata';
+import { graphStore } from '../graph';
 import type { ImageRow } from '../types';
-import sharp from 'sharp';
-
-interface ScanOpts {
-  dir: string;
-}
 
 const IMAGE_EXTS = new Set(['.webp', '.png', '.jpg', '.jpeg', '.tiff', '.gif']);
 
@@ -28,8 +23,7 @@ async function readFileAsBuffer(filePath: string): Promise<Buffer> {
   return readFile(filePath);
 }
 
-function filenameToImageRow(filename: string, meta: any, buffer: Buffer): ImageRow {
-  const ext = extname(filename).replace('.', '').toLowerCase();
+function filenameToImageRow(filename: string, meta: ReadMetadataResult): ImageRow {
   return {
     id: meta.id ?? filename.replace(/\.\w+$/, ''),
     s3_key: `scanned/${filename}`,
@@ -86,7 +80,7 @@ async function main() {
       const buffer = await readFileAsBuffer(join(dir, filename));
       const ext = extname(filename).replace('.', '');
       const meta = await readImageMetadata(buffer, ext);
-      const row = filenameToImageRow(filename, meta, buffer);
+      const row = filenameToImageRow(filename, meta);
       rows.push(row);
 
       const fieldCount = [row.style, row.mood, row.use_case, row.subject, ...row.tags ?? []]

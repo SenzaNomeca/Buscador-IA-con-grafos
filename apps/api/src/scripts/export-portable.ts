@@ -10,9 +10,9 @@
  * Requiere exiftool instalado (libimage-exiftool-perl).
  * Si exiftool no está, exporta sin metadatos (degradación silenciosa).
  */
-import { mkdir, writeFile, readdir } from 'fs/promises';
+import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
-import { GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
 import sharp from 'sharp';
 import { config } from '../config';
 import { s3 } from '../s3';
@@ -21,10 +21,6 @@ import { embedMetadata, checkExiftool } from '../metadata';
 import type { ImageRow } from '../types';
 
 const OUTPUT_DIR = join(process.cwd(), 'export-vorael');
-
-interface ExportOpts {
-  outDir: string;
-}
 
 // ── Fetch desde S3 + Postgres ────────────────────────────────────────────────
 

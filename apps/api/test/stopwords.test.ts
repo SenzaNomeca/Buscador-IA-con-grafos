@@ -11,10 +11,13 @@ describe('isStopword', () => {
     expect(isStopword('para')).toBe(true);
   });
 
-  it('es insensible a mayúsculas', () => {
+  it('es insensible a mayúsculas y tildes', () => {
     expect(isStopword('UNA')).toBe(true);
     expect(isStopword('De')).toBe(true);
     expect(isStopword('FRENTE')).toBe(true);
+    expect(isStopword('según')).toBe(true);
+    expect(isStopword('más')).toBe(true);
+    expect(isStopword('está')).toBe(true);
   });
 
   it('no marca palabras con contenido', () => {

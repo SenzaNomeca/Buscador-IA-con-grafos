@@ -4,8 +4,12 @@ import type {
   FiltersResponse,
   Image,
   PaginatedImages,
+  SearchItem,
+  SearchTier,
+  SearchTierSlice,
   Stats,
   TagWithCount,
+  TierCounts,
 } from '@/types/image';
 
 // In dev, leave VITE_API_URL empty so axios stays relative ("/api/...") and
@@ -63,6 +67,10 @@ export interface SearchParams {
   mode?: SearchMode;
   /** Si es 1, la respuesta trae el subgrafo de la búsqueda en `graph`. */
   graph?: boolean;
+  /** Devuelve la primera página de cada tramo (parecidos/encajar/similares). */
+  grouped?: boolean;
+  /** Filtra la paginación a un tramo concreto. */
+  tier?: SearchTier;
 }
 
 /** Modes accepted by GET /api/search. */
@@ -72,15 +80,65 @@ export function isSearchMode(v: unknown): v is SearchMode {
   return v === 'lexical' || v === 'semantic' || v === 'hybrid';
 }
 
-export interface SearchResponse extends PaginatedImages {
+export interface SearchResponse {
+  items: SearchItem[];
+  page: number;
+  limit: number;
+  total: number;
+  hasMore: boolean;
+  /** Total de todos los tramos (puede ser mayor que `total` si se filtró por tier). */
+  grandTotal?: number;
+  tier?: SearchTier;
+  tierCounts: TierCounts;
   q: string;
   mode: string;
   /** Presente cuando se pidió con graph=1. */
   graph?: GraphExport;
 }
 
+export interface GroupedSearchResponse {
+  q: string;
+  mode: string;
+  total: number;
+  tierCounts: TierCounts;
+  tiers: SearchTierSlice[];
+  /** Presente cuando se pidió con graph=1. */
+  graph?: GraphExport;
+}
+
+export interface TierSearchResponse extends SearchResponse {
+  grandTotal: number;
+  tier: SearchTier;
+}
+
 export async function searchImages(params: SearchParams): Promise<SearchResponse> {
   const { data } = await api.get<SearchResponse>('/api/search', { params });
+  return data;
+}
+
+/** Primera página de cada tramo en una sola request. */
+export async function searchGrouped(
+  q: string,
+  mode?: SearchMode,
+  limit = 12,
+): Promise<GroupedSearchResponse> {
+  const { data } = await api.get<GroupedSearchResponse>('/api/search', {
+    params: { q, mode, limit, grouped: true },
+  });
+  return data;
+}
+
+/** Página siguiente de un tramo concreto (botón "Ver más"). */
+export async function searchByTier(
+  q: string,
+  tier: SearchTier,
+  mode?: SearchMode,
+  page = 1,
+  limit = 12,
+): Promise<TierSearchResponse> {
+  const { data } = await api.get<TierSearchResponse>('/api/search', {
+    params: { q, mode, tier, page, limit },
+  });
   return data;
 }
 
@@ -199,7 +257,7 @@ export async function downloadImage(id: string, format: DownloadFormat): Promise
     );
     return data;
   } catch (err) {
-    throw new Error(await downloadErrorMessage(err));
+    throw new Error(await downloadErrorMessage(err), { cause: err });
   }
 }
 

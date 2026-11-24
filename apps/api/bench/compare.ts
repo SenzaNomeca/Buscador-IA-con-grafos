@@ -4,9 +4,8 @@
  * Requiere conexión a Postgres real (apps/api/.env).
  * Ejecutar: npx ts-node --transpile-only bench/compare.ts
  */
-import { config } from '../src/config';
 import { pool } from '../src/db';
-import { buildGraph, search, related, tagsList, tagImages, filters, stats } from '../src/graph';
+import { buildGraph, search, related, tagsList, filters, stats } from '../src/graph';
 import type { ImageRow } from '../src/types';
 
 async function fetchAllRows(): Promise<ImageRow[]> {
@@ -86,10 +85,6 @@ function median(arr: number[]): number {
   const sorted = arr.slice().sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
-function avg(arr: number[]): number {
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
 async function main() {

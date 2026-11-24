@@ -17,12 +17,6 @@
 import { Pool } from 'pg';
 import type { ImageRow } from '../types';
 
-function env(name: string): string {
-  const v = process.env[name];
-  if (!v || v.trim() === '') throw new Error(`Missing env ${name}`);
-  return v;
-}
-
 const EMBED_MODEL = process.env.EMBED_MODEL || 'bge-m3';
 const EMBED_SERVER = (process.env.EMBED_SERVER || 'http://127.0.0.1:11434').replace(/\/$/, '');
 const BATCH = 32;

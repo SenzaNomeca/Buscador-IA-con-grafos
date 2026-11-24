@@ -12,7 +12,12 @@
  *    páginas; si el remoto no ordena DESC, cae a full.
  *  - Si `local + nuevas < total remoto`, el volcado local está incompleto
  *    (parcial o con filas que el remoto ya no tiene) → full, que reconcilia.
- *  - `SYNC_FULL_MS` (default 7 días) fuerza un full periódico de todos modos.
+ *  - Si el remoto tiene MENOS filas que el local (reinicio de la BD / bajas),
+ *    también se fuerza el full: el incremental nunca elimina, y dejaría el
+ *    catálogo local "hinchado" con imágenes que ya no existen.
+ *  - `SYNC_FULL_MS` (default 7 días) fuerza un full periódico. Antes de ese
+ *    full se persiste el incremental: si el full falla o tarda, las imágenes
+ *    nuevas ya están disponibles en disco.
  *
  * Escritura atómica (tmp + rename con reintentos): la API puede estar leyendo
  * el JSON mientras se reemplaza — ver `dataSource.getImageRows`.
@@ -325,6 +330,8 @@ async function runIncremental(
   const collected: ImageRow[] = [];
   let page = 1;
   let consecutiveKnown = 0;
+  // Se asigna en la primera vuelta; el 0 solo satisface la asignación definida.
+  // eslint-disable-next-line no-useless-assignment
   let totalRemote = 0;
   let prevLast: ImageRow | undefined;
   let ordered = true;
@@ -367,7 +374,8 @@ async function runIncremental(
  *
  * Modo incremental (default): agrega las filas nuevas que falten y conserva
  * las existentes; no reescribe el archivo si no hubo cambios.
- * Modo full: reemplaza el volcado por el contenido completo del remoto.
+ * Modo full: reemplaza el volcado por el contenido completo del remoto. Si el
+ * full se debe a antigüedad, primero persiste el incremental (ver arriba).
  *
  * Devuelve el resultado; ya loguea el resumen (o usa opts.log para capturarlo).
  */
@@ -403,8 +411,12 @@ export async function syncCatalog(opts: SyncOptions = {}): Promise<SyncResult> {
   let removed = 0;
   let totalRemote = 0;
   let pages = 0;
+  let prePersisted = false;
 
-  let reason: string | null = fullReason;
+  // Un full por antigüedad ('stale') también hace primero el incremental: así
+  // las filas nuevas quedan servibles aunque la reconciliación completa tarde
+  // o falle. 'forced' y 'missing' siguen yendo directo al full.
+  let reason: string | null = fullReason === 'stale' ? null : fullReason;
   if (!reason) {
     const inc = await runIncremental(fetchPage, delayMs, safetyPages, local.rows, log);
     totalRemote = inc.totalRemote;
@@ -413,10 +425,22 @@ export async function syncCatalog(opts: SyncOptions = {}): Promise<SyncResult> {
       reason = 'orden remoto no es DESC';
     } else if (local.rows.length + inc.collected.length < totalRemote) {
       reason = `local ${local.rows.length}+${inc.collected.length} < remoto ${totalRemote} (volcado parcial o deletes)`;
+    } else if (local.rows.length > totalRemote) {
+      // El remoto se encogió (reinicio de la base / bajas). El merge incremental
+      // no quita filas: hace falta el full para reconciliar de inmediato.
+      reason = `remoto ${totalRemote} < local ${local.rows.length} (reset del catálogo o bajas)`;
     } else {
       const merged = mergeRows(local.rows, inc.collected);
       added = merged.added;
       rows = merged.rows;
+      if (fullReason === 'stale') {
+        if (added > 0) {
+          await writeAtomic(dest, rows);
+          prePersisted = true;
+          log(`[sync] ${added} filas nuevas guardadas antes del full de reconciliación`);
+        }
+        reason = 'full periódico (SYNC_FULL_MS)';
+      }
     }
   }
 
@@ -437,7 +461,8 @@ export async function syncCatalog(opts: SyncOptions = {}): Promise<SyncResult> {
   }
 
   // Escritura solo si algo cambió (evita relecturas del JSON de 100MB en vano).
-  const written = !local.ok || added > 0 || removed > 0;
+  // `prePersisted` cubre el incremental que ya se guardó antes del full.
+  const written = prePersisted || !local.ok || added > 0 || removed > 0;
   if (written) {
     await writeAtomic(dest, rows);
   }

@@ -279,6 +279,35 @@ describe('syncCatalog (incremental)', () => {
     expect(res.added).toBe(2);
     expect(res.written).toBe(true);
   });
+
+  it('si el remoto encogió (bajas) hace full y quita las filas sobrantes', async () => {
+    await writeFile(dest, JSON.stringify(rowsDesc(8))); // local: [7…0]
+    const { fetchPage } = fakeFetcher(rowsDesc(3), 3); // remoto: [2…0]
+
+    const res = await syncCatalog(opts(fetchPage));
+
+    expect(res.mode).toBe('full');
+    expect(res.totalRemote).toBe(3);
+    expect(res.totalLocal).toBe(3);
+    expect(res.removed).toBe(5);
+    expect(res.written).toBe(true);
+    const saved = JSON.parse(await readFile(dest, 'utf8')) as ImageRow[];
+    expect(saved.map((r) => r.id)).toEqual(['img-0002', 'img-0001', 'img-0000']);
+  });
+
+  it('si reiniciaron el catálogo (menos filas y nuevos ids) full de inmediato', async () => {
+    await writeFile(dest, JSON.stringify(rowsDesc(5))); // local: [4…0]
+    const { fetchPage } = fakeFetcher(rowsDesc(2, 10), 3); // remoto: [11,10]
+
+    const res = await syncCatalog(opts(fetchPage));
+
+    expect(res.mode).toBe('full');
+    expect(res.added).toBe(2);
+    expect(res.removed).toBe(5);
+    expect(res.totalLocal).toBe(2);
+    const saved = JSON.parse(await readFile(dest, 'utf8')) as ImageRow[];
+    expect(saved.map((r) => r.id)).toEqual(['img-0011', 'img-0010']);
+  });
 });
 
 describe('syncCatalog (full)', () => {
@@ -323,6 +352,43 @@ describe('syncCatalog (full)', () => {
     expect(res.mode).toBe('full');
     expect(res.added).toBe(0);
     expect(calls).toEqual([1, 2]); // full igual recorre todo, sin corte temprano
+  });
+
+  it('stale: persiste el incremental aunque después falle el full', async () => {
+    const remote = rowsDesc(10); // [9…0]
+    await writeFile(dest, JSON.stringify(remote.slice(3))); // local: [6…0]
+    await writeFile(join(dir, '.sync-state.json'), JSON.stringify({ lastFullAt: 1 }));
+    const { fetchPage } = fakeFetcher(remote, 3);
+    let calls = 0;
+    const failOnFull = async (page: number): Promise<Page> => {
+      calls += 1;
+      if (calls > 3) throw new Error('full boom');
+      return fetchPage(page);
+    };
+
+    await expect(syncCatalog(opts(failOnFull, { fullIntervalMs: 1 }))).rejects.toThrow('full boom');
+
+    const saved = JSON.parse(await readFile(dest, 'utf8')) as ImageRow[];
+    expect(saved).toHaveLength(10);
+    expect(saved[0].id).toBe('img-0009');
+  });
+
+  it('stale: hace incremental y luego completa el full reconciliador', async () => {
+    const remote = rowsDesc(10); // [9…0]
+    await writeFile(dest, JSON.stringify(remote.slice(3))); // local: [6…0]
+    await writeFile(join(dir, '.sync-state.json'), JSON.stringify({ lastFullAt: 1 }));
+    const { fetchPage, calls } = fakeFetcher(remote, 3);
+
+    const res = await syncCatalog(opts(fetchPage, { fullIntervalMs: 1 }));
+
+    expect(res.mode).toBe('full');
+    expect(res.added).toBe(3);
+    expect(res.totalLocal).toBe(10);
+    // 3 páginas del incremental + 4 del full completo
+    expect(calls).toEqual([1, 2, 3, 1, 2, 3, 4]);
+    const saved = JSON.parse(await readFile(dest, 'utf8')) as ImageRow[];
+    expect(saved).toHaveLength(10);
+    expect(saved[0].id).toBe('img-0009');
   });
 });
 

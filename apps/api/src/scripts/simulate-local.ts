@@ -23,10 +23,10 @@ const pool = new Pool({
 
 const LOCAL_DIR = path.join(__dirname, '../../test-images-real');
 
-async function downloadS3Object(key: string, localPath: string): Promise<Buffer> {
+async function downloadS3Object(key: string): Promise<Buffer> {
   const res = await s3.send(new GetObjectCommand({ Bucket: config.s3.bucket, Key: key }));
-  const chunks: any[] = [];
-  for await (const chunk of res.Body as any) chunks.push(chunk);
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of res.Body as AsyncIterable<Uint8Array>) chunks.push(chunk);
   return Buffer.concat(chunks);
 }
 
@@ -54,7 +54,7 @@ async function main() {
     const mockMeta = MOCK_IMAGES[i % MOCK_IMAGES.length];
     
     console.log(`[simulate] Descargando ${key}...`);
-    const buffer = await downloadS3Object(key, '');
+    const buffer = await downloadS3Object(key);
     
     const localFilename = path.basename(key);
     const localPath = path.join(LOCAL_DIR, localFilename);

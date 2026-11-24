@@ -5,9 +5,8 @@ import { config } from './config';
 import { pingDb } from './db';
 import { graphStore, fetchAllRows, fetchDeltaRows } from './graph';
 import { warmSemanticIndex, startSemanticRefresh } from './embeddings';
-import { startAutoSync } from './autoSync';
+import { startAutoSync, syncOnce } from './autoSync';
 import type { ImageRow } from './types';
-import type { GraphStore } from './graph';
 import { imagesRouter } from './routes/images';
 import { searchRouter } from './routes/search';
 import { tagsRouter } from './routes/tags';
@@ -124,9 +123,11 @@ if (require.main === module) {
     pingDb()
       .then(() => console.log('[api] postgres ok'))
       .catch((e) => console.warn('[api] postgres ping failed:', e.message));
+    // Primero el volcado (si hay DB_FILE): así el grafo nace con datos en vez
+    // de vacío. Si falla, se reintenta cada AUTO_SYNC_MS.
+    if (config.autoSync.onBoot) await syncOnce('boot');
     await bootGraph();
-    // Auto-sync del volcado (solo con AUTO_SYNC_MS>0 y DB_FILE); el grafo ya
-    // está corriendo, así que cada sync nuevo entra en el siguiente tick.
+    // Timers de sync (cada 60 s por defecto) y de refresh del grafo ya activos.
     startAutoSync();
   });
 }
